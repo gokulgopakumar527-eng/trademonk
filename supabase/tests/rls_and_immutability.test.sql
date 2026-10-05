@@ -666,7 +666,7 @@ end $$;
 create function t.open(
   uid uuid, asset uuid, qty numeric, ref numeric,
   cash numeric default 10000, slip numeric default 5, feebps numeric default 10,
-  qsource text default 'binance-public', side text default 'BUY'
+  qsource text default 'binance-public', side text default 'BUY', ikey text default null
 ) returns jsonb language plpgsql as $$
 declare
   entry numeric := round(ref * (10000 + slip) / 10000, 8);
@@ -674,7 +674,7 @@ declare
   fee numeric := round(notional * feebps / 10000, 8);
 begin
   return public.open_paper_trade(uid, asset, side, qty, entry, fee, cash, 'PAPER_SIM_V1', ref, slip, feebps,
-    qsource, now(), now(), false);
+    qsource, now(), now(), false, coalesce(ikey, 'test-key-' || gen_random_uuid()::text));
 end $$;
 
 do $$
@@ -774,9 +774,9 @@ begin
   -- ── The function does not trust the caller's arithmetic or inputs ──
   perform t.service();
   select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
-  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 1, 0.0002, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false)$q$, alice, btc), 'entry price does not match', 'input: a cheaper-than-derived entry price is refused');
-  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 100.05, 0, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false)$q$, alice, btc), 'fee does not match', 'input: a zero fee is refused when the rate says otherwise');
-  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 100, 0.3, 10000, 'PAPER_SIM_V1', 100, 0, 10, 's', now(), now(), false)$q$, alice, btc), 'fee does not match', 'input: a wrong fee for a zero-slippage fill is refused');
+  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 1, 0.0002, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false, 'direct-call-key-0001')$q$, alice, btc), 'entry price does not match', 'input: a cheaper-than-derived entry price is refused');
+  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 100.05, 0, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false, 'direct-call-key-0001')$q$, alice, btc), 'fee does not match', 'input: a zero fee is refused when the rate says otherwise');
+  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 100, 0.3, 10000, 'PAPER_SIM_V1', 100, 0, 10, 's', now(), now(), false, 'direct-call-key-0001')$q$, alice, btc), 'fee does not match', 'input: a wrong fee for a zero-slippage fill is refused');
   perform t.fails_with(format('select t.open(%L, %L, 2, 100, side := %L)', alice, btc, 'SELL'), 'side SELL is not supported', 'input: SELL is refused');
   perform t.fails_with(format('select t.open(%L, %L, 2, 100, side := %L)', alice, btc, 'SHORT'), 'side SHORT is not supported', 'input: SHORT is refused');
   perform t.fails_with(format('select t.open(%L, %L, 0, 100)', alice, btc), 'PAPER_INVALID_INPUT', 'input: zero quantity is refused');
@@ -790,8 +790,8 @@ begin
   perform t.fails_with(format('select t.open(%L, %L, 2, 100)', alice, dead), 'PAPER_ASSET_NOT_FOUND', 'input: an inactive asset is refused');
   perform t.fails_with(format('select t.open(%L, %L, 2, 100)', alice, 'eeeeeeee-0000-0000-0000-000000000099'), 'PAPER_ASSET_NOT_FOUND', 'input: an unknown asset is refused');
   perform t.fails_with(format('select t.open(%L, %L, 2, 100)', 'ffffffff-0000-0000-0000-000000000099', btc), 'unknown user', 'input: an unknown user is refused');
-  perform t.fails(format($q$select public.open_paper_trade(null, %L, 'BUY', 2, 100.05, 0.2001, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false)$q$, btc), 'input: a null user is refused');
-  perform t.fails(format($q$select public.open_paper_trade(%L, %L, 'BUY', null, 100.05, 0.2001, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false)$q$, alice, btc), 'input: a null quantity is refused');
+  perform t.fails(format($q$select public.open_paper_trade(null, %L, 'BUY', 2, 100.05, 0.2001, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false, 'direct-call-key-0001')$q$, btc), 'input: a null user is refused');
+  perform t.fails(format($q$select public.open_paper_trade(%L, %L, 'BUY', null, 100.05, 0.2001, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false, 'direct-call-key-0001')$q$, alice, btc), 'input: a null quantity is refused');
   perform t.superuser();
   perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal, 'input: no refused call changed the balance');
   perform t.ok((select count(*) from public.paper_trades where user_id = alice) = 3, 'input: no refused call created a trade');
@@ -1105,6 +1105,245 @@ begin
       where x.sim_version is not null and p.status <> 'CLOSED') = 0, 'invariant: every settled result belongs to a CLOSED trade');
   perform t.ok((select count(*) from public.paper_trades where user_id = bob and status = 'CLOSED') = 0
     and (select cash_balance from public.paper_accounts where user_id = bob and currency = 'USDT') = 9799.6999, 'invariant: Bob''s trade and cash were never touched by anyone else''s closes');
+end $$;
+
+-- ── 12. Phase 5C-7C-A: idempotent open (PAPER TRADING, NO REAL MONEY) ──
+-- Same user + same key = one logical open. Real concurrency (separate sessions) is covered in
+-- concurrency.sh; everything here is single-session and deterministic.
+do $$
+declare
+  alice uuid := 'aaaaaaaa-0000-0000-0000-000000000001';
+  bob   uuid := 'bbbbbbbb-0000-0000-0000-000000000002';
+  btc   uuid := 'dddddddd-0000-0000-0000-000000000001';
+  rel   uuid := 'dddddddd-0000-0000-0000-000000000002';
+  eth   uuid := 'dddddddd-0000-0000-0000-000000000003';
+  k1 text := 'idem-key-alice-0001';
+  sig text := 'public.open_paper_trade(uuid,uuid,text,numeric,numeric,numeric,numeric,text,numeric,numeric,numeric,text,timestamptz,timestamptz,boolean,text)';
+  r1 jsonb; r2 jsonb; r3 jsonb; rb jsonb; tid uuid; bal numeric; bal2 numeric; n int;
+begin
+  perform t.superuser();
+  delete from public.paper_trades;
+  delete from public.paper_accounts;
+  insert into public.assets (id, market, symbol, name, asset_type, currency) values
+    (eth, 'CRYPTO', 'ETH', 'Ethereum', 'CRYPTO', 'USDT') on conflict do nothing;
+  insert into public.assets (id, market, symbol, name, asset_type, currency) values
+    (rel, 'NSE', 'RELIANCE', 'Reliance Industries', 'EQUITY', 'INR') on conflict do nothing;
+
+  -- ── A. First open: one trade, one debit, one fee, key + receipt stored ──
+  perform t.service();
+  r1 := t.open(alice, btc, 2, 100, ikey => k1);
+  perform t.superuser();
+  tid := (r1 -> 'trade' ->> 'id')::uuid;
+  perform t.ok((r1 ->> 'replayed')::boolean = false, 'idem A: the first open is not a replay');
+  perform t.ok(r1 -> 'trade' ->> 'idempotency_key' = k1, 'idem A: the key is stored on the trade');
+  perform t.ok((r1 ->> 'cash_balance_after')::numeric = 9799.6999 and (r1 -> 'trade' ->> 'cash_balance_after')::numeric = 9799.6999,
+    'idem A: the receipt balance is stored and returned (10000 - 200.3001)');
+  perform t.ok((select count(*) from public.paper_trades where user_id = alice) = 1, 'idem A: exactly one trade');
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = 9799.6999, 'idem A: cash debited exactly once');
+  perform t.ok((select sum(fees) from public.paper_trades where user_id = alice) = 0.2001, 'idem A: the fee was charged exactly once');
+
+  -- ── B. Sequential replay: nothing new is created, debited or charged ──
+  perform t.service();
+  r2 := t.open(alice, btc, 2, 100, ikey => k1);
+  perform t.superuser();
+  perform t.ok(r2 -> 'trade' ->> 'id' = r1 -> 'trade' ->> 'id', 'idem B: the replay returns the SAME trade');
+  perform t.ok((r2 ->> 'replayed')::boolean = true, 'idem B: the replay is flagged replayed = true');
+  perform t.ok((select count(*) from public.paper_trades where user_id = alice) = 1, 'idem B: still exactly one trade');
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = 9799.6999, 'idem B: no second debit');
+  perform t.ok((select sum(fees) from public.paper_trades where user_id = alice) = 0.2001, 'idem B: no second fee');
+  perform t.ok((r2 ->> 'cash_balance_after')::numeric = 9799.6999, 'idem B: the replay receipt carries the original balance');
+
+  -- a retry legitimately re-quotes: a different reference price is still the same logical request
+  perform t.service();
+  r3 := t.open(alice, btc, 2, 105, ikey => k1);
+  perform t.superuser();
+  perform t.ok(r3 -> 'trade' ->> 'id' = r1 -> 'trade' ->> 'id' and (r3 -> 'trade' ->> 'entry_price')::numeric = 100.05,
+    'idem B: a replay with a refreshed quote returns the ORIGINAL fill, not the new price');
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = 9799.6999, 'idem B: a re-quoted replay debits nothing');
+
+  -- the receipt stays the original after the balance has since moved
+  perform t.service();
+  perform t.open(alice, btc, 1, 100);   -- a different, intentional open (random key): cost 100.15005
+  r2 := t.open(alice, btc, 2, 100, ikey => k1);
+  perform t.superuser();
+  perform t.ok((r2 ->> 'cash_balance_after')::numeric = 9799.6999
+      and (select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = 9699.54985,
+    'idem B: the replay returns the ORIGINAL post-open balance, not today''s (9699.54985)');
+
+  -- ── C. Different keys, identical trade parameters: separate intentional opens ──
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  perform t.service();
+  perform t.open(alice, btc, 2, 100, ikey => 'idem-key-alice-diff-A');
+  perform t.open(alice, btc, 2, 100, ikey => 'idem-key-alice-diff-B');
+  perform t.superuser();
+  perform t.ok((select count(*) from public.paper_trades where user_id = alice and quantity = 2) = 3, 'idem C: different keys with identical parameters are NOT deduplicated');
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal - 2 * 200.3001, 'idem C: each separate open debited once');
+  perform t.ok((select count(distinct idempotency_key) from public.paper_trades where user_id = alice) = (select count(*) from public.paper_trades where user_id = alice),
+    'idem C: every trade carries its own key');
+
+  -- ── D. The same key for two users is two independent operations ──
+  perform t.service();
+  r2 := t.open(bob, btc, 2, 100, ikey => k1);
+  perform t.superuser();
+  perform t.ok((r2 ->> 'replayed')::boolean = false and r2 -> 'trade' ->> 'id' <> r1 -> 'trade' ->> 'id', 'idem D: Bob using Alice''s key creates his own trade');
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = bob and currency = 'USDT') = 9799.6999, 'idem D: Bob''s account debited once');
+  perform t.ok((select count(*) from public.paper_trades where idempotency_key = k1) = 2, 'idem D: one trade per user for the shared key');
+  perform t.login(bob);
+  perform t.count_is(format('select 1 from public.paper_trades where id = %L', tid), 0, 'idem D: Bob cannot read Alice''s trade through the shared key');
+  perform t.count_is(format('select 1 from public.paper_trades where idempotency_key = %L', k1), 1, 'idem D: Bob sees only his own trade for that key');
+  perform t.login(alice);
+  perform t.count_is(format('select 1 from public.paper_trades where idempotency_key = %L', k1), 1, 'idem D: Alice sees only her own trade for that key');
+  perform t.superuser();
+
+  -- ── E. Reusing a key for a different logical trade is refused, with no side effects ──
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  select count(*) into n from public.paper_trades where user_id = alice;
+  perform t.service();
+  perform t.fails_with(format('select t.open(%L, %L, 3, 100, ikey => %L)', alice, btc, k1), 'PAPER_IDEMPOTENCY_KEY_REUSED', 'idem E: same key, different quantity');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, eth, k1), 'PAPER_IDEMPOTENCY_KEY_REUSED', 'idem E: same key, different asset');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, side => %L, ikey => %L)', alice, btc, 'LONG', k1), 'PAPER_IDEMPOTENCY_KEY_REUSED', 'idem E: same key, different side');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, rel, k1), 'PAPER_IDEMPOTENCY_KEY_REUSED', 'idem E: same key, an asset in another currency (a different account)');
+  perform t.superuser();
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal and (select count(*) from public.paper_trades where user_id = alice) = n,
+    'idem E: refused reuse changed neither cash nor trades');
+  perform t.ok(not exists (select 1 from public.paper_accounts where user_id = alice and currency = 'INR'), 'idem E: refused reuse did not even create the other-currency account');
+
+  -- ── F. Missing / invalid keys are refused before anything is written ──
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  select count(*) into n from public.paper_trades where user_id = alice;
+  perform t.service();
+  perform t.fails_with(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 100.05, 0.2001, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false, null)$q$, alice, btc),
+    'idempotency key is required', 'idem F: a NULL key is refused');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, ''), 'idempotency key is required', 'idem F: an empty key is refused');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, 'abcdefghijklmno'), 'idempotency key is required', 'idem F: a 15-character key is too short');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, repeat('a', 129)), 'idempotency key is required', 'idem F: a 129-character key is too long');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, 'has a space in it 12345'), 'idempotency key is required', 'idem F: a key with spaces is refused');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, 'bad/slash-key-123456'), 'idempotency key is required', 'idem F: a key with a slash is refused');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, 'quote''s-key-1234567890'), 'idempotency key is required', 'idem F: a key with a quote is refused');
+  perform t.fails_with(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, E'newline-key-12345\n6789'), 'idempotency key is required', 'idem F: a key with a newline is refused');
+  perform t.fails(format($q$select public.open_paper_trade(%L, %L, 'BUY', 2, 100.05, 0.2001, 10000, 'PAPER_SIM_V1', 100, 5, 10, 's', now(), now(), false)$q$, alice, btc),
+    'idem F: the old 15-argument call no longer exists');
+  perform t.superuser();
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal and (select count(*) from public.paper_trades where user_id = alice) = n,
+    'idem F: no refused call changed cash or trades');
+  perform t.service();
+  perform t.open(alice, btc, 1, 100, ikey => 'exactly-16-chars-');                       -- 17 chars: format boundary is OK
+  perform t.open(alice, btc, 1, 100, ikey => repeat('b', 128));                          -- 128 chars: upper boundary is OK
+  perform t.open(alice, btc, 1, 100, ikey => 'Mixed.Case_Key-0123456789');
+  perform t.superuser();
+  perform t.ok((select count(*) from public.paper_trades where user_id = alice) = n + 3, 'idem F: keys at the length boundary and mixed-case/./_/- keys are accepted');
+
+  -- ── G. Rollback never poisons a key ──
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  select count(*) into n from public.paper_trades where user_id = alice;
+  perform t.service();
+  perform t.fails_with(format('select t.open(%L, %L, 1000000, 100, ikey => %L)', alice, btc, 'rollback-key-cash-0001'), 'PAPER_INSUFFICIENT_CASH', 'idem G: an unaffordable open is refused');
+  perform t.superuser();
+  perform t.ok(not exists (select 1 from public.paper_trades where idempotency_key = 'rollback-key-cash-0001')
+      and (select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal,
+    'idem G: the refused open left no trade, no key and no cash change');
+  perform t.service();
+  rb := t.open(alice, btc, 1, 100, ikey => 'rollback-key-cash-0001');
+  perform t.superuser();
+  perform t.ok((rb ->> 'replayed')::boolean = false and (select count(*) from public.paper_trades where idempotency_key = 'rollback-key-cash-0001') = 1,
+    'idem G: the SAME key then succeeds once the failure is gone (not poisoned)');
+
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  perform t.service();
+  begin
+    perform t.open(alice, btc, 1, 100, ikey => 'rollback-key-boom-0001');   -- succeeds, then the transaction fails
+    raise exception 'BOOM: injected failure after the insert';
+  exception when others then
+    if sqlerrm not like '%BOOM%' then raise; end if;
+  end;
+  perform t.superuser();
+  perform t.ok(not exists (select 1 from public.paper_trades where idempotency_key = 'rollback-key-boom-0001')
+      and (select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal,
+    'idem G: a failure AFTER the insert rolled back the trade, the key and the debit together');
+  perform t.service();
+  rb := t.open(alice, btc, 1, 100, ikey => 'rollback-key-boom-0001');
+  perform t.superuser();
+  perform t.ok((rb ->> 'replayed')::boolean = false
+      and (select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal - 100.15005,
+    'idem G: the key succeeds on a later valid retry, debiting exactly once');
+
+  -- ── H. The asset-active check only gates NEW opens ──
+  perform t.service();
+  r1 := t.open(alice, eth, 1, 100, ikey => 'deactivate-key-eth-0001');
+  perform t.superuser();
+  update public.assets set is_active = false where id = eth;
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  perform t.service();
+  r2 := t.open(alice, eth, 1, 100, ikey => 'deactivate-key-eth-0001');
+  perform t.ok((r2 ->> 'replayed')::boolean = true and r2 -> 'trade' ->> 'id' = r1 -> 'trade' ->> 'id', 'idem H: a replay still resolves after the asset is deactivated');
+  perform t.fails_with(format('select t.open(%L, %L, 1, 100, ikey => %L)', alice, eth, 'deactivate-key-eth-0002'), 'PAPER_ASSET_NOT_FOUND', 'idem H: a NEW open on the deactivated asset is still refused');
+  perform t.superuser();
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal, 'idem H: neither call changed cash');
+  update public.assets set is_active = true where id = eth;
+
+  -- ── I. Close is unaffected, and a replay after the close does not reopen or re-debit ──
+  select (r1 -> 'trade' ->> 'id')::uuid into tid;
+  perform t.service();
+  perform t.close(alice, tid, 110);
+  perform t.fails_with(format('select t.close(%L, %L, 110)', alice, tid), 'PAPER_TRADE_NOT_OPEN', 'idem I: closing again is still refused');
+  perform t.superuser();
+  select cash_balance into bal from public.paper_accounts where user_id = alice and currency = 'USDT';
+  select count(*) into n from public.paper_trades where user_id = alice;
+  perform t.service();
+  r2 := t.open(alice, eth, 1, 100, ikey => 'deactivate-key-eth-0001');
+  perform t.superuser();
+  perform t.ok((r2 ->> 'replayed')::boolean = true and r2 -> 'trade' ->> 'status' = 'CLOSED', 'idem I: a replay after the close returns the trade as CLOSED (not reopened)');
+  perform t.ok((select cash_balance from public.paper_accounts where user_id = alice and currency = 'USDT') = bal and (select count(*) from public.paper_trades where user_id = alice) = n,
+    'idem I: the replay after the close debited nothing and created nothing');
+  perform t.ok((select count(*) from public.paper_trade_results where paper_trade_id = tid) = 1, 'idem I: still exactly one result for the closed trade');
+  perform t.ok((r2 ->> 'cash_balance_after')::numeric = (select cash_balance_after from public.paper_trades where id = tid), 'idem I: the receipt balance is still the original');
+  perform t.ok((select a.starting_cash
+        + coalesce((select sum(x.pnl) from public.paper_trade_results x where x.account_id = a.id), 0)
+        - coalesce((select sum(p.cash_debited) from public.paper_trades p where p.account_id = a.id and p.status = 'OPEN'), 0)
+        = a.cash_balance
+      from public.paper_accounts a where a.user_id = alice and a.currency = 'USDT'),
+    'idem I: the account ledger identity holds after opens, replays and a close');
+
+  -- ── J. Privileges, RLS, immutability, structure ──
+  perform t.anon();
+  perform t.fails(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, 'anon-key-0000000001'), 'idem J: anon cannot execute the idempotent open');
+  perform t.login(alice);
+  perform t.fails(format('select t.open(%L, %L, 2, 100, ikey => %L)', alice, btc, 'auth-key-000000001a'), 'idem J: authenticated cannot execute it for self');
+  perform t.fails(format('select t.open(%L, %L, 2, 100, ikey => %L)', bob, btc, 'auth-key-000000001b'), 'idem J: authenticated cannot execute it for another user');
+  perform t.fails(format('select t.open(%L, %L, 2, 100, ikey => %L)', bob, btc, k1), 'idem J: authenticated cannot replay Bob''s key either');
+  perform t.fails(format('update public.paper_trades set idempotency_key = %L where id = %L', 'hijacked-key-0000001', tid), 'idem J: a user cannot modify idempotency_key');
+  perform t.fails(format('update public.paper_trades set cash_balance_after = 1 where id = %L', tid), 'idem J: a user cannot modify cash_balance_after');
+  perform t.fails(format($q$insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity, idempotency_key, cash_balance_after) values (%L, %L, 'BUY', 1, 1, 'forged-key-0000000001', 1)$q$, alice, btc),
+    'idem J: a user cannot insert a trade carrying a key');
+  perform t.service();
+  perform t.fails_with(format('update public.paper_trades set idempotency_key = %L where id = %L', 'hijacked-key-0000002', tid), 'entry record is immutable', 'idem J: even service_role cannot change idempotency_key');
+  perform t.fails_with(format('update public.paper_trades set cash_balance_after = 1 where id = %L', tid), 'entry record is immutable', 'idem J: even service_role cannot change cash_balance_after');
+  perform t.superuser();
+  perform t.ok(not has_function_privilege('anon', sig, 'execute') and not has_function_privilege('authenticated', sig, 'execute')
+      and has_function_privilege('service_role', sig, 'execute'), 'idem J: EXECUTE is service_role only');
+  perform t.ok(to_regprocedure('public.open_paper_trade(uuid,uuid,text,numeric,numeric,numeric,numeric,text,numeric,numeric,numeric,text,timestamptz,timestamptz,boolean)') is null
+      and (select count(*) from pg_proc where proname = 'open_paper_trade' and pronamespace = 'public'::regnamespace) = 1,
+    'idem J: no key-less open_paper_trade overload exists');
+  perform t.ok((select relrowsecurity from pg_class where oid = 'public.paper_trades'::regclass), 'idem J: RLS is still enabled on paper_trades');
+  perform t.ok(exists (select 1 from pg_index i where i.indexrelid = 'public.paper_trades_user_idempotency_key_uidx'::regclass and i.indisunique and i.indpred is not null),
+    'idem J: the owner-scoped unique index is unique and partial');
+
+  -- constraints, exercised directly as superuser (the only role that could bypass the function)
+  perform t.fails_with(format($q$insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity, idempotency_key) values (%L, %L, 'BUY', 1, 1, 'key-without-receipt-001')$q$, alice, btc),
+    'paper_trades_idempotency_receipt', 'idem J: a key without a receipt balance violates the table constraint');
+  perform t.fails_with(format($q$insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity, cash_balance_after) values (%L, %L, 'BUY', 1, 1, 5)$q$, alice, btc),
+    'paper_trades_idempotency_receipt', 'idem J: a receipt balance without a key violates the table constraint');
+  perform t.fails_with(format($q$insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity, idempotency_key, cash_balance_after) values (%L, %L, 'BUY', 1, 1, 'short', 5)$q$, alice, btc),
+    'paper_trades_idempotency_key_format', 'idem J: a malformed key violates the table constraint');
+  perform t.fails_with(format($q$insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity, idempotency_key, cash_balance_after) values (%L, %L, 'BUY', 1, 1, %L, -1)$q$, alice, btc, 'negative-balance-key-01'),
+    'paper_trades_cash_balance_after_value', 'idem J: a negative receipt balance violates the table constraint');
+  perform t.fails_with(format($q$insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity, idempotency_key, cash_balance_after) values (%L, %L, 'BUY', 1, 1, %L, 5)$q$, alice, btc, k1),
+    'paper_trades_user_idempotency_key_uidx', 'idem J: the unique index refuses a duplicate (user, key) even for a direct insert');
+  insert into public.paper_trades (user_id, asset_id, side, entry_price, quantity) values
+    (alice, btc, 'BUY', 1, 1), (alice, btc, 'BUY', 1, 1);
+  perform t.ok((select count(*) from public.paper_trades where user_id = alice and idempotency_key is null) = 2,
+    'idem J: pre-existing style rows with a NULL key remain valid, and many NULLs are allowed');
+  delete from public.paper_trades where user_id = alice and idempotency_key is null;
 end $$;
 
 drop schema t cascade;

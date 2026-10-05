@@ -13,7 +13,7 @@ const stripTs = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\
 const stripSql = (s: string) => s.replace(/--.*$/gm, "");
 const stmts = (sql: string) => sql.split(";").map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean);
 
-const migFile = readdirSync(path.join(ROOT, "supabase/migrations")).find((f) => f.includes("paper_trade_open"))!;
+const migFile = readdirSync(path.join(ROOT, "supabase/migrations")).find((f) => f.endsWith("_paper_trade_open.sql"))!;
 const mig = stripSql(read("supabase/migrations", migFile));
 const migStmts = stmts(mig);
 
@@ -126,7 +126,8 @@ describe("layering and client authority", () => {
     const walk = (d: string): string[] =>
       readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : /\.tsx?$/.test(e.name) ? [path.join(d, e.name)] : []));
     const files = ["app", "components"].flatMap((d) => walk(path.join(ROOT, d)));
-    const rel = (fs: string[]) => fs.map((f) => path.relative(ROOT, f)).sort();
+    const rel = (fs: string[]) =>
+  fs.map((f) => path.relative(ROOT, f).replace(/\\/g, "/")).sort();
     // Stricter than before for the service layer: no page or component may import it at all.
     expect(rel(files.filter((f) => /services\/paper-trading/.test(readFileSync(f, "utf8"))))).toEqual([]);
     expect(rel(files.filter((f) => /openPaperTradeAction/.test(readFileSync(f, "utf8"))))).toEqual(["components/paper-trading/open-trade-panel.tsx"]);

@@ -34,11 +34,12 @@ describe("paper_trades / paper_trade_results privileges", () => {
       expect(g).not.toMatch(/\banon\b|\bpublic\b\s*;?$/i);
     }
   });
-  it("no later statement grants on these tables, except the service-role-only open_paper_trade() (5C-2) and close_paper_trade() (5C-3) functions", () => {
+  it("no later statement grants on these tables, except the service-role-only open_paper_trade() (5C-2), close_paper_trade() (5C-3) and the 16-argument open_paper_trade() (5C-7C-A) functions", () => {
     const stray = touching(/^grant\b/i).filter((g) => /paper_trade/i.test(g) && !grants.includes(g));
-    expect(stray).toHaveLength(2);
+    expect(stray).toHaveLength(3);
     expect(stray[0]).toMatch(/^grant execute on function public\.open_paper_trade\(.*\) to service_role$/i);
     expect(stray[1]).toMatch(/^grant execute on function public\.close_paper_trade\(.*\) to service_role$/i);
+    expect(stray[2]).toMatch(/^grant execute on function public\.open_paper_trade\(.*boolean, text \) to service_role$/i);
   });
 });
 

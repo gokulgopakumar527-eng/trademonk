@@ -107,9 +107,10 @@ describe("5C-5 server additions are read-only and owner-scoped", () => {
       expect(strip(read("services/paper-trading", f)), f).not.toMatch(/store\.(openTrade|closeTrade)|deps\.audit/);
     }
   });
-  it("no new migration was added in this phase", () => {
+  it("5C-5 itself added no migration: only the open-idempotency migration (5C-7C-A) follows close", () => {
     const names = readdirSync(path.join(ROOT, "supabase/migrations")).sort();
-    expect(names.at(-1)).toContain("paper_trade_close");
+    const afterClose = names.slice(names.findIndex((n) => n.includes("paper_trade_close")) + 1);
+    expect(afterClose.map((n) => n.replace(/^\d+_/, ""))).toEqual(["paper_trade_open_idempotency.sql"]);
   });
   it("the preview action has its own rate-limit bucket and checks it after authentication", () => {
     const actions = strip(read("features/paper-trading/actions.ts"));

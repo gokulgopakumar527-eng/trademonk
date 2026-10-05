@@ -21,10 +21,10 @@ const migStmts = stmts(mig);
 const fnBody = mig.slice(mig.indexOf("create function public.close_paper_trade"));
 
 describe("migration 8: privileges and RLS", () => {
-  it("exists, and is the newest migration, ordered after the open-trade migration", () => {
+  it("exists, ordered after the open-trade migration; only the open-idempotency migration follows it", () => {
     expect(migFile).toBeDefined();
-    expect(all.indexOf(migFile)).toBeGreaterThan(all.findIndex((f) => f.includes("paper_trade_open")));
-    expect(all.at(-1)).toBe(migFile);
+    expect(all.indexOf(migFile)).toBeGreaterThan(all.findIndex((f) => f.endsWith("_paper_trade_open.sql")));
+    expect(all.slice(all.indexOf(migFile) + 1).map((f) => f.replace(/^\d+_/, ""))).toEqual(["paper_trade_open_idempotency.sql"]);
   });
   it("close_paper_trade() is executable by service_role only", () => {
     expect(mig).toMatch(/revoke execute on function public\.close_paper_trade\([^)]*\) from public, anon, authenticated/i);
@@ -190,7 +190,8 @@ describe("close flow: layering and client authority", () => {
     const walk = (d: string): string[] =>
       readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : /\.tsx?$/.test(e.name) ? [path.join(d, e.name)] : []));
     const files = ["app", "components"].flatMap((d) => walk(path.join(ROOT, d)));
-    const rel = (fs: string[]) => fs.map((f) => path.relative(ROOT, f)).sort();
+    const rel = (fs: string[]) =>
+  fs.map((f) => path.relative(ROOT, f).replace(/\\/g, "/")).sort();
     expect(rel(files.filter((f) => /services\/paper-trading/.test(readFileSync(f, "utf8"))))).toEqual([]);
     expect(rel(files.filter((f) => /closePaperTradeAction/.test(readFileSync(f, "utf8"))))).toEqual(["components/paper-trading/close-position-button.tsx"]);
   });
