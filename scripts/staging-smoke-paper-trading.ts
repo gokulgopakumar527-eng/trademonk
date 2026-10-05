@@ -16,14 +16,21 @@
  * (banning) the test users this run created. Every created id is written to
  * smoke-artifacts/<runId>.json (no secrets) so test data stays identifiable.
  *
+ * Phase 5C-7C-C adds the open-trade IDEMPOTENCY lifecycle (migration 9): the removed key-less RPC signature,
+ * first open, same-key replay, conflicting reuse (asset / side / quantity), a new intent, concurrent duplicates,
+ * failure safety, per-user key scope and the privilege boundary around the two new columns. Those checks
+ * (I0-I9) drive the REAL paper-trading service -> REAL SupabasePaperTradingStore -> REAL open_paper_trade();
+ * only the quote source is a stub (fixed test prices, isMock=true).
+ *
  * Run through the package script: it enables the `react-server` condition that `server-only` needs.
- * Exit codes: 0 all checks passed, 1 at least one check FAILED, 2 refused / prerequisites missing.
+ * Exit codes: 0 no check FAILED, 1 at least one check FAILED, 2 refused / prerequisites missing.
+ * A BLOCKED check is not a pass: the summary says so and the phase is not validated until none are blocked.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { PAPER_SIMULATION } from "../config/paper-trading";
+import { PAPER_EXECUTION_LIMITS, PAPER_SIMULATION } from "../config/paper-trading";
 import {
   realizedLongPnl,
   simulateLongEntry,
@@ -34,8 +41,10 @@ import {
   formatSignedScaled,
   parseDecimalAmount,
   parseSignedDecimalAmount,
+  priceToScaled,
   type Scaled,
 } from "../services/paper-trading/money";
+import type { OpenedPaperTrade } from "../services/paper-trading/types";
 import {
   argValue,
   evaluateSmokeGuard,
@@ -43,14 +52,16 @@ import {
   newRunId,
   smokeEmail,
 } from "./lib/staging-smoke-guard";
+import {
+  formatCheckLine,
+  formatTally,
+  isLegacySignatureGone,
+  leaksRawDatabaseText,
+  smokeIdempotencyKey,
+  tally,
+  type CheckRecord,
+} from "./lib/staging-smoke-idempotency";
 
-type Outcome = "PASS" | "FAIL" | "BLOCKED";
-interface CheckRecord {
-  id: string;
-  name: string;
-  outcome: Outcome;
-  detail?: string;
-}
 interface DbError {
   message: string;
   code?: string;
@@ -77,9 +88,7 @@ async function check(id: string, name: string, fn: () => Promise<string | void>)
     rec = { id, name, outcome: error instanceof Blocked ? "BLOCKED" : "FAIL", detail: msg };
   }
   checks.push(rec);
-  console.log(
-    `${rec.outcome.padEnd(7)} ${id}  ${name}${rec.detail ? `\n          ${rec.detail}` : ""}`,
-  );
+  console.log(formatCheckLine(rec));
 }
 
 function need<T>(value: T | undefined | null, what: string): T {
@@ -137,6 +146,10 @@ async function main(): Promise<number> {
 
   const { createSupabaseAdminClient } = await import("../lib/supabase/admin");
   const { SupabasePaperTradingStore } = await import("../services/paper-trading/supabase-store");
+  const { createPaperTradingService } =
+    await import("../services/paper-trading/paper-trading-service");
+  const { PaperTradeRejectedError } = await import("../services/paper-trading/errors");
+  const { writeAuditLog } = await import("../services/audit/audit-service");
   const admin = createSupabaseAdminClient();
   const store = new SupabasePaperTradingStore();
   const plainClient = (): SupabaseClient =>
@@ -177,6 +190,7 @@ async function main(): Promise<number> {
     pnl?: Scaled;
     closeParams?: Parameters<typeof store.closeTrade>[0];
     openParams?: Parameters<typeof store.openTrade>[0];
+    privKey?: string;
   } = {};
   const quote = {
     source: `staging-smoke:${runId}`,
@@ -184,6 +198,12 @@ async function main(): Promise<number> {
     fetchedAt: new Date().toISOString(),
     isMock: true,
   };
+
+  await check(
+    "G0",
+    "staging project guard (declared staging project, never production)",
+    async () => `project ${projectRef}, mode ${mode}`,
+  );
 
   // ── Preflight (read-only; runs in both modes) ──
   await check("P1", "target asset exists and is active", async () => {
@@ -221,7 +241,7 @@ async function main(): Promise<number> {
   });
   await check(
     "P2",
-    "migrations 7/8 columns are readable through PostgREST (::text casts)",
+    "migrations 7/8/9 columns are readable through PostgREST (::text casts; idempotency_key + cash_balance_after = migration 9 applied)",
     async () => {
       const a = await admin
         .from("paper_accounts")
@@ -229,7 +249,9 @@ async function main(): Promise<number> {
         .limit(1);
       const t = await admin
         .from("paper_trades")
-        .select("quantity::text, cash_debited::text, notional::text")
+        .select(
+          "quantity::text, cash_debited::text, notional::text, idempotency_key, cash_balance_after::text",
+        )
         .limit(1);
       const r = await admin
         .from("paper_trade_results")
@@ -246,7 +268,7 @@ async function main(): Promise<number> {
   );
   await check(
     "P3",
-    "open_paper_trade / close_paper_trade exist for service_role (probe is rejected before any write)",
+    "open_paper_trade (16-arg, with idempotency key) / close_paper_trade exist for service_role (probe is rejected before any write)",
     async () => {
       const o = await admin.rpc("open_paper_trade", {
         p_user_id: randomUUID(),
@@ -264,6 +286,7 @@ async function main(): Promise<number> {
         p_quote_as_of: quote.asOf,
         p_quote_fetched_at: quote.fetchedAt,
         p_quote_is_mock: true,
+        p_idempotency_key: smokeIdempotencyKey("probe"),
       });
       assert(
         o.error?.message.includes("PAPER_INVALID_INPUT"),
@@ -287,6 +310,34 @@ async function main(): Promise<number> {
       assert(
         c.error?.message.includes("PAPER_TRADE_NOT_FOUND"),
         `close probe: expected PAPER_TRADE_NOT_FOUND, got ${c.error?.message ?? "success"}`,
+      );
+    },
+  );
+
+  await check(
+    "P4",
+    "the key-less 15-argument open_paper_trade no longer exists (migration 9 dropped it: no bypass path)",
+    async () => {
+      const legacy = await admin.rpc("open_paper_trade", {
+        p_user_id: randomUUID(),
+        p_asset_id: randomUUID(),
+        p_side: "SELL",
+        p_quantity: "1",
+        p_entry_price: "1",
+        p_fee: "0",
+        p_starting_cash: "1",
+        p_sim_version: "probe",
+        p_reference_price: "1",
+        p_slippage_bps: "0",
+        p_fee_bps: "0",
+        p_quote_source: "probe",
+        p_quote_as_of: quote.asOf,
+        p_quote_fetched_at: quote.fetchedAt,
+        p_quote_is_mock: true,
+      });
+      assert(
+        isLegacySignatureGone(legacy.error),
+        `the 15-argument signature is still callable or failed unexpectedly: ${legacy.error?.message ?? "success"}. If PostgREST reports the 16-argument function missing right after the migration, reload its schema cache and re-run.`,
       );
     },
   );
@@ -338,6 +389,42 @@ async function main(): Promise<number> {
   const userA = () => need(ctx.userA, "user A");
   const userB = () => need(ctx.userB, "user B");
 
+  // ── Read helpers (service role; read-only) ──
+  const cashOf = async (userId: string, currency: string): Promise<Scaled | null> => {
+    const { data, error } = await admin
+      .from("paper_accounts")
+      .select("cash_balance::text")
+      .eq("user_id", userId)
+      .eq("currency", currency)
+      .maybeSingle();
+    if (error) throw new Error(`paper_accounts read failed: ${error.message}`);
+    if (!data) return null;
+    const parsed = parseSignedDecimalAmount(data.cash_balance);
+    assert(parsed !== null, "account balance is not an exact decimal");
+    return parsed;
+  };
+  const tradeCountOf = async (userId: string): Promise<number> => {
+    const { count, error } = await admin
+      .from("paper_trades")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId);
+    if (error) throw new Error(`paper_trades count failed: ${error.message}`);
+    return count ?? 0;
+  };
+  /** Trades carrying an idempotency key (optionally for one user). Text casts keep decimals exact. */
+  const rowsForKey = async (userId: string | null, key: string) => {
+    let q = admin
+      .from("paper_trades")
+      .select(
+        "id, user_id, asset_id, side, status, quantity::text, cash_balance_after::text, idempotency_key",
+      )
+      .eq("idempotency_key", key);
+    if (userId) q = q.eq("user_id", userId);
+    const { data, error } = await q;
+    if (error) throw new Error(`paper_trades key lookup failed: ${error.message}`);
+    return data ?? [];
+  };
+
   await check(
     "C1",
     "[4] portfolio snapshot of a brand-new user is empty (no account, trades or results)",
@@ -370,12 +457,12 @@ async function main(): Promise<number> {
         slippageBps: e.appliedSlippageBps,
         feeBps: e.appliedFeeBps,
         quote,
-        // Minimal compile fix for the 16-argument RPC. Replay/conflict smoke checks belong to Phase 5C-7C-C.
-        idempotencyKey: `smoke-${crypto.randomUUID()}`,
+        idempotencyKey: smokeIdempotencyKey("c2"),
       };
       ctx.openParams = params;
       const res = await store.openTrade(params);
       assert(res.ok, `open was refused: ${res.ok ? "" : res.reason}`);
+      assert(res.replayed === false, "a first open must report replayed=false");
       ctx.tradeId = res.tradeId;
       (artifact.tradeIds as string[]).push(res.tradeId);
       flush();
@@ -395,7 +482,7 @@ async function main(): Promise<number> {
       const { data, error } = await admin
         .from("paper_trades")
         .select(
-          "status, side, quantity::text, entry_price::text, fees::text, notional::text, cash_debited::text, reference_price::text, sim_version, quote_is_mock, account_id",
+          "status, side, quantity::text, entry_price::text, fees::text, notional::text, cash_debited::text, reference_price::text, sim_version, quote_is_mock, account_id, idempotency_key, cash_balance_after::text",
         )
         .eq("id", need(ctx.tradeId, "trade"))
         .maybeSingle();
@@ -411,6 +498,15 @@ async function main(): Promise<number> {
       assert(
         data.quote_is_mock === true && data.sim_version === PAPER_SIMULATION.version,
         "provenance fields wrong",
+      );
+      assert(
+        data.idempotency_key === need(ctx.openParams, "open params").idempotencyKey,
+        "idempotency_key was not stored on the trade",
+      );
+      sameAmount(
+        data.cash_balance_after,
+        need(ctx.cashAfterOpen, "cash after open"),
+        "stored cash_balance_after",
       );
       ctx.accountId = data.account_id as string;
     },
@@ -537,6 +633,7 @@ async function main(): Promise<number> {
     async () => {
       const open = need(ctx.openParams, "open params");
       const close = need(ctx.closeParams, "close params");
+      ctx.privKey = smokeIdempotencyKey("priv");
       const openArgs = {
         p_user_id: open.userId,
         p_asset_id: open.assetId,
@@ -553,6 +650,8 @@ async function main(): Promise<number> {
         p_quote_as_of: open.quote.asOf,
         p_quote_fetched_at: open.quote.fetchedAt,
         p_quote_is_mock: true,
+        // A FRESH key: if the privilege boundary were open, this call would really create a trade.
+        p_idempotency_key: ctx.privKey,
       };
       const closeArgs = {
         p_user_id: close.userId,
@@ -583,6 +682,10 @@ async function main(): Promise<number> {
         }
       }
       await stateIsUntouched("after direct RPC attempts");
+      assert(
+        (await rowsForKey(null, ctx.privKey)).length === 0,
+        "a trade carrying the privilege-probe key exists: a client executed open_paper_trade",
+      );
     },
   );
 
@@ -760,8 +863,14 @@ async function main(): Promise<number> {
   );
 
   await check("C14", "[8] two CONCURRENT closes of one trade settle it exactly once", async () => {
-    const open = await store.openTrade({ ...need(ctx.openParams, "open params"), quote });
+    // A NEW intent needs a NEW key: reusing C2's key would be a replay of the already-closed first trade.
+    const open = await store.openTrade({
+      ...need(ctx.openParams, "open params"),
+      quote,
+      idempotencyKey: smokeIdempotencyKey("c14"),
+    });
     assert(open.ok, `second open refused: ${open.ok ? "" : open.reason}`);
+    assert(!open.replayed, "the second open (new key) was treated as a replay");
     (artifact.tradeIds as string[]).push(open.tradeId);
     flush();
     const params = { ...need(ctx.closeParams, "close params"), tradeId: open.tradeId };
@@ -826,6 +935,549 @@ async function main(): Promise<number> {
     },
   );
 
+  // ── Idempotency lifecycle (Phase 5C-7C-C, migration 9) ──
+  // REAL service -> REAL store -> REAL open_paper_trade() on staging, user A (user B for the scope check).
+  // Only the quote source is a stub: fixed test prices labelled `staging-smoke:<runId>`, isMock=true. Audit
+  // rows are written by the real audit writer and counted in audit_logs. Each check measures a BEFORE and
+  // AFTER state from the database itself, so it does not depend on what earlier checks left behind.
+  const idem = { qty: "0.01", btcRef: 60000, ethRef: 3000, concurrentRounds: 3 };
+  const smokePrices: Record<string, number> = { BTC: idem.btcRef, ETH: idem.ethRef };
+  const auditEvents: Array<{ action: string; entityId?: string }> = [];
+  const service = createPaperTradingService({
+    marketData: {
+      getQuote: async (asset) => {
+        const price = smokePrices[asset.symbol];
+        if (price === undefined) {
+          return {
+            ok: false,
+            message: "Data unavailable",
+            error: {
+              code: "UPSTREAM_ERROR",
+              message: "no staging-smoke price for this symbol",
+              provider: "staging-smoke",
+              retryable: false,
+            },
+          };
+        }
+        const at = new Date().toISOString();
+        return {
+          ok: true,
+          servedFrom: "PROVIDER",
+          freshness: { status: "FRESH", ageMs: 0, label: "staging-smoke test price" },
+          data: {
+            source: quote.source,
+            asOf: at,
+            fetchedAt: at,
+            isMock: true,
+            market: asset.market,
+            symbol: asset.symbol,
+            currency: asset.currency,
+            price,
+            change: null,
+            changePct: null,
+            high: null,
+            low: null,
+            volume: null,
+          },
+        };
+      },
+    },
+    store,
+    audit: async (e) => {
+      auditEvents.push({ action: e.action, ...(e.entityId ? { entityId: e.entityId } : {}) });
+      await writeAuditLog(e);
+    },
+    now: () => new Date(),
+    config: PAPER_SIMULATION,
+    limits: PAPER_EXECUTION_LIMITS,
+    allowMockData: true, // this script only ever runs against the guarded staging project
+  });
+  const I: {
+    btcId?: string;
+    ethId?: string;
+    key1?: string;
+    first?: OpenedPaperTrade;
+  } = {};
+  const startUsdt = (): Scaled =>
+    scaledFromNumber(PAPER_SIMULATION.startingCash.USDT, "USDT starting cash");
+  const btcFill = () =>
+    simulateLongEntry({
+      referencePrice: need(priceToScaled(idem.btcRef), "BTC reference"),
+      quantity: need(parseDecimalAmount(idem.qty), "quantity"),
+      rates: PAPER_SIMULATION.markets.CRYPTO,
+    });
+  const openInput = (
+    key: string,
+    over: Partial<{ assetId: string; side: string; quantity: string }> = {},
+  ) => ({
+    assetId: need(I.btcId, "BTC asset"),
+    side: "BUY",
+    quantity: idem.qty,
+    idempotencyKey: key,
+    ...over,
+  });
+  const auditCountFor = async (tradeId: string): Promise<number> => {
+    const { count, error } = await admin
+      .from("audit_logs")
+      .select("id", { count: "exact", head: true })
+      .eq("entity_id", tradeId)
+      .eq("action", "paper_trade.opened");
+    if (error) throw new Error(`audit_logs count failed: ${error.message}`);
+    return count ?? 0;
+  };
+  const snap = async (userId: string, key?: string) => ({
+    count: await tradeCountOf(userId),
+    cash: await cashOf(userId, "USDT"),
+    audits: auditEvents.length,
+    rows: key ? await rowsForKey(userId, key) : [],
+  });
+  type Snap = Awaited<ReturnType<typeof snap>>;
+  const sameSnap = (what: string, before: Snap, after: Snap): void => {
+    assert(after.count === before.count, `${what}: trade count ${before.count} -> ${after.count}`);
+    assert(after.cash === before.cash, `${what}: cash balance changed`);
+    assert(after.audits === before.audits, `${what}: an audit entry was written`);
+    assert(
+      JSON.stringify(after.rows) === JSON.stringify(before.rows),
+      `${what}: the stored rows for the key changed`,
+    );
+  };
+  const expectRejected = async (
+    label: string,
+    userId: string,
+    input: unknown,
+    reason: string,
+  ): Promise<void> => {
+    let accepted = false;
+    try {
+      await service.openTrade(userId, input);
+      accepted = true;
+    } catch (e) {
+      assert(
+        e instanceof PaperTradeRejectedError,
+        `${label}: expected a PaperTradeRejectedError, got ${e instanceof Error ? `${e.name}: ${redact(e.message)}` : String(e)}`,
+      );
+      assert(e.reason === reason, `${label}: reason was ${e.reason}, expected ${reason}`);
+      assert(
+        e.code === "VALIDATION",
+        `${label}: application code was ${e.code}, expected VALIDATION`,
+      );
+      assert(
+        !leaksRawDatabaseText(e.message),
+        `${label}: the user-facing message contains database internals`,
+      );
+    }
+    assert(!accepted, `${label}: the request was ACCEPTED but must be rejected`);
+  };
+
+  await check(
+    "I0",
+    "test assets CRYPTO:BTC and CRYPTO:ETH are active USDT assets (ETH is the conflicting-asset probe)",
+    async () => {
+      const { data, error } = await admin
+        .from("assets")
+        .select("id, symbol, currency")
+        .eq("market", "CRYPTO")
+        .in("symbol", ["BTC", "ETH"])
+        .eq("is_active", true);
+      if (error) throw new Error(`assets read failed: ${error.message}`);
+      const btc = data?.find((a) => a.symbol === "BTC");
+      const eth = data?.find((a) => a.symbol === "ETH");
+      if (!btc || !eth)
+        throw new Blocked(
+          `blocked: need active CRYPTO:BTC and CRYPTO:ETH (seed with pnpm seed:assets --project-ref ${projectRef})`,
+        );
+      assert(btc.currency === "USDT" && eth.currency === "USDT", "BTC/ETH are not USDT assets");
+      I.btcId = btc.id as string;
+      I.ethId = eth.id as string;
+      const cash = await cashOf(userA(), "USDT");
+      // Room for: first open, new intent, 3 concurrent rounds and the post-failure retry (6 x cost).
+      assert(
+        (cash ?? startUsdt()) >= btcFill().cashRequired * 8n,
+        "user A's USDT balance cannot fund the idempotency checks; lower idem.qty",
+      );
+    },
+  );
+
+  await check(
+    "I1",
+    "first open: replayed=false, exactly one trade, balance debited once, key + cash_balance_after stored, one audit row",
+    async () => {
+      const key = smokeIdempotencyKey("i1");
+      const before = await snap(userA(), key);
+      const res = await service.openTrade(userA(), openInput(key));
+      I.key1 = key;
+      I.first = res;
+      (artifact.tradeIds as string[]).push(res.id);
+      flush();
+      assert(res.replayed === false, "a first open must report replayed=false");
+      const fill = btcFill();
+      const expectedCash = (before.cash ?? startUsdt()) - fill.cashRequired;
+      const after = await snap(userA(), key);
+      assert(
+        after.count === before.count + 1,
+        `expected exactly one new trade, got ${after.count - before.count}`,
+      );
+      assert(after.rows.length === 1, `expected one row for the key, found ${after.rows.length}`);
+      const row = after.rows[0]!;
+      assert(row.id === res.id, "the returned trade is not the stored trade");
+      assert(row.status === "OPEN" && row.idempotency_key === key, "stored key/status wrong");
+      sameAmount(row.quantity, need(parseDecimalAmount(idem.qty), "qty"), "stored quantity");
+      sameAmount(row.cash_balance_after, expectedCash, "stored cash_balance_after");
+      assert(
+        after.cash === expectedCash,
+        "the balance was not debited exactly once by the exact cost",
+      );
+      assert(
+        res.cashBalanceAfter === Number(formatScaled(expectedCash)),
+        "the returned cashBalanceAfter does not match the debited balance",
+      );
+      assert((await auditCountFor(res.id)) === 1, "expected exactly one audit row for the open");
+      return `trade ${res.id}`;
+    },
+  );
+
+  await check(
+    "I2",
+    "same-key replay (re-quoted at a different price): replayed=true, same trade id, ORIGINAL receipt, no second trade/debit/audit",
+    async () => {
+      const first = need(I.first, "first open");
+      const key = need(I.key1, "first key");
+      const before = await snap(userA(), key);
+      smokePrices.BTC = idem.btcRef + 500; // a legitimate retry re-quotes; the stored receipt must win
+      let res: OpenedPaperTrade;
+      try {
+        res = await service.openTrade(userA(), openInput(key));
+      } finally {
+        smokePrices.BTC = idem.btcRef;
+      }
+      assert(res.replayed === true, "the repeated request must report replayed=true");
+      assert(res.id === first.id, "a replay must return the SAME trade id");
+      assert(
+        res.entryPrice === first.entryPrice,
+        "the replay returned a re-priced fill, not the stored receipt",
+      );
+      assert(res.referencePrice === first.referencePrice, "the replay's reference price changed");
+      assert(res.cashDebited === first.cashDebited, "the replay's cash debited changed");
+      assert(
+        res.cashBalanceAfter === first.cashBalanceAfter,
+        "the replay's cashBalanceAfter changed",
+      );
+      assert(res.openedAt === first.openedAt, "the replay's openedAt changed");
+      sameSnap("after the replay", before, await snap(userA(), key));
+      assert((await auditCountFor(first.id)) === 1, "the replay created a duplicate audit row");
+    },
+  );
+
+  const conflict = async (
+    label: string,
+    over: Partial<{ assetId: string; side: string; quantity: string }>,
+  ): Promise<void> => {
+    const key = need(I.key1, "first key");
+    const before = await snap(userA(), key);
+    await expectRejected(label, userA(), openInput(key, over), "IDEMPOTENCY_KEY_REUSED");
+    sameSnap(`after the ${label}`, before, await snap(userA(), key));
+    const row = before.rows[0]!;
+    assert(
+      row.id === need(I.first, "first open").id && row.idempotency_key === key,
+      "the original trade no longer owns the key",
+    );
+  };
+  await check(
+    "I3a",
+    "same key + DIFFERENT ASSET (ETH) is rejected as IDEMPOTENCY_KEY_REUSED; no trade, no debit, safe message",
+    () => conflict("different-asset reuse", { assetId: need(I.ethId, "ETH asset") }),
+  );
+  await check(
+    "I3b",
+    "same key + DIFFERENT SIDE (BUY -> LONG, the only other openable side) is rejected; no trade, no debit",
+    () => conflict("different-side reuse", { side: "LONG" }),
+  );
+  await check("I3c", "same key + DIFFERENT QUANTITY is rejected; no trade, no debit", () =>
+    conflict("different-quantity reuse", { quantity: "0.02" }),
+  );
+
+  await check(
+    "I4",
+    "new intent (NEW key): a different trade is created and debited once; the first key still belongs to the first trade",
+    async () => {
+      const key1 = need(I.key1, "first key");
+      const first = need(I.first, "first open");
+      const key2 = smokeIdempotencyKey("i4");
+      const before = await snap(userA(), key2);
+      const res = await service.openTrade(userA(), openInput(key2));
+      (artifact.tradeIds as string[]).push(res.id);
+      flush();
+      assert(res.replayed === false, "a new key must create a new trade (replayed=false)");
+      assert(res.id !== first.id, "the new intent returned the first trade's id");
+      const after = await snap(userA(), key2);
+      assert(after.count === before.count + 1, "expected exactly one new trade");
+      assert(
+        after.cash === (before.cash ?? startUsdt()) - btcFill().cashRequired,
+        "the new trade was not debited exactly once",
+      );
+      assert(
+        after.rows.length === 1 && after.rows[0]!.id === res.id,
+        "the new key is not bound to the new trade",
+      );
+      const old = await rowsForKey(userA(), key1);
+      assert(
+        old.length === 1 && old[0]!.id === first.id,
+        "the first key no longer belongs to the first trade",
+      );
+    },
+  );
+
+  await check(
+    "I5",
+    `concurrent duplicate open (same user/asset/side/quantity/key, x${idem.concurrentRounds} rounds of 2 requests): one trade, one debit, one original + one replay`,
+    async () => {
+      for (let round = 1; round <= idem.concurrentRounds; round++) {
+        const key = smokeIdempotencyKey(`i5r${round}`);
+        const before = await snap(userA(), key);
+        const settled = await Promise.allSettled([
+          service.openTrade(userA(), openInput(key)),
+          service.openTrade(userA(), openInput(key)),
+        ]);
+        const rejected = settled.filter((r) => r.status === "rejected");
+        assert(
+          rejected.length === 0,
+          `round ${round}: a concurrent duplicate FAILED instead of resolving as replay: ${rejected
+            .map((r) => redact(r.reason instanceof Error ? r.reason.message : String(r.reason)))
+            .join(" | ")}`,
+        );
+        const results = settled.map((r) => (r as PromiseFulfilledResult<OpenedPaperTrade>).value);
+        const originals = results.filter((r) => !r.replayed);
+        const replays = results.filter((r) => r.replayed);
+        assert(
+          originals.length === 1 && replays.length === 1,
+          `round ${round}: expected 1 original + 1 replay, got ${originals.length} + ${replays.length}`,
+        );
+        const original = originals[0]!;
+        assert(
+          replays[0]!.id === original.id,
+          `round ${round}: the replay returned a different trade`,
+        );
+        (artifact.tradeIds as string[]).push(original.id);
+        flush();
+        const after = await snap(userA(), key);
+        assert(after.count === before.count + 1, `round ${round}: expected exactly one new trade`);
+        assert(after.rows.length === 1, `round ${round}: ${after.rows.length} rows hold the key`);
+        assert(
+          after.cash === (before.cash ?? startUsdt()) - btcFill().cashRequired,
+          `round ${round}: the balance was not debited exactly once`,
+        );
+        assert((await auditCountFor(original.id)) === 1, `round ${round}: expected one audit row`);
+      }
+      return `${idem.concurrentRounds} rounds, each: 1 trade, 1 debit, 1 original + 1 replay`;
+    },
+  );
+
+  await check(
+    "I6",
+    "failure safety: a refused open (insufficient paper cash) leaves no key, trade, debit or audit, and the key is still usable afterwards",
+    async () => {
+      const key = smokeIdempotencyKey("i6");
+      const before = await snap(userA(), key);
+      // 1 BTC at the test price far exceeds user A's USDT balance: raised inside the transaction, after the key lock.
+      await expectRejected(
+        "oversized open",
+        userA(),
+        openInput(key, { quantity: "1" }),
+        "INSUFFICIENT_PAPER_CASH",
+      );
+      const afterFail = await snap(userA(), key);
+      sameSnap("after the refused open", before, afterFail);
+      assert(afterFail.rows.length === 0, "a refused open left an orphan idempotency key");
+      // The same key must now work for a real, affordable open (no false replay receipt, no KEY_REUSED).
+      const res = await service.openTrade(userA(), openInput(key));
+      (artifact.tradeIds as string[]).push(res.id);
+      flush();
+      assert(
+        res.replayed === false,
+        "the key was treated as already used after a rolled-back attempt",
+      );
+      const afterOk = await snap(userA(), key);
+      assert(
+        afterOk.rows.length === 1 && afterOk.rows[0]!.id === res.id,
+        "the retry did not store the key",
+      );
+      assert(
+        afterOk.cash === (before.cash ?? startUsdt()) - btcFill().cashRequired,
+        "the retry was not debited exactly once",
+      );
+    },
+  );
+
+  await check(
+    "I7",
+    "key scope is per user: user B opens with the SAME key user A used, gets its own trade; A's trade is untouched",
+    async () => {
+      const key = need(I.key1, "first key");
+      const first = need(I.first, "first open");
+      const beforeA = await snap(userA(), key);
+      const beforeB = await snap(userB(), key);
+      assert(beforeB.rows.length === 0, "user B unexpectedly already holds that key");
+      const res = await service.openTrade(userB(), openInput(key));
+      (artifact.tradeIds as string[]).push(res.id);
+      flush();
+      assert(res.replayed === false, "B's open was treated as a replay of A's trade");
+      assert(res.id !== first.id, "B received A's trade id");
+      const afterB = await snap(userB(), key);
+      assert(
+        afterB.count === beforeB.count + 1 && afterB.rows.length === 1,
+        "B should own exactly one new trade",
+      );
+      assert(
+        afterB.cash === (beforeB.cash ?? startUsdt()) - btcFill().cashRequired,
+        "B's balance was not debited exactly once",
+      );
+      const afterA = await snap(userA(), key);
+      assert(afterA.count === beforeA.count, "B's open changed A's trade count");
+      assert(afterA.cash === beforeA.cash, "B's open changed A's balance");
+      assert(
+        JSON.stringify(afterA.rows) === JSON.stringify(beforeA.rows),
+        "B's open changed A's keyed trade",
+      );
+      const both = await rowsForKey(null, key);
+      assert(
+        both.length === 2 && new Set(both.map((r) => r.user_id)).size === 2,
+        `expected the key on exactly two trades owned by two different users, found ${both.length}`,
+      );
+    },
+  );
+
+  await check(
+    "I8a",
+    "RLS: each user reads only their own idempotency-keyed trades (positive control included); B cannot see A's",
+    async () => {
+      const key = need(I.key1, "first key");
+      const first = need(I.first, "first open");
+      const a = await need(ctx.clientA, "client A")
+        .from("paper_trades")
+        .select("id, idempotency_key");
+      assert(!a.error, `A read failed: ${a.error?.message}`);
+      assert(
+        a.data?.some((r) => r.id === first.id && r.idempotency_key === key),
+        "RLS positive control failed: A cannot read their own keyed trade",
+      );
+      const b = await need(ctx.clientB, "client B").from("paper_trades").select("id, user_id");
+      assert(!b.error, `B read failed: ${b.error?.message}`);
+      assert(
+        (b.data ?? []).every((r) => r.user_id === userB()) &&
+          !b.data?.some((r) => r.id === first.id),
+        "B can read a trade it does not own",
+      );
+    },
+  );
+
+  await check(
+    "I8b",
+    "authenticated and anon clients cannot insert paper_trades or write idempotency_key / cash_balance_after",
+    async () => {
+      const key = need(I.key1, "first key");
+      const first = need(I.first, "first open");
+      const before = await rowsForKey(userA(), key);
+      const a = need(ctx.clientA, "client A");
+      denied(
+        "insert paper_trades with idempotency_key + cash_balance_after",
+        await a
+          .from("paper_trades")
+          .insert({
+            user_id: userA(),
+            asset_id: need(I.btcId, "BTC asset"),
+            side: "BUY",
+            entry_price: 1,
+            quantity: 1,
+            status: "OPEN",
+            idempotency_key: smokeIdempotencyKey("forged"),
+            cash_balance_after: 999999,
+          })
+          .select(),
+      );
+      denied(
+        "update paper_trades.idempotency_key",
+        await a
+          .from("paper_trades")
+          .update({ idempotency_key: smokeIdempotencyKey("rebound") })
+          .eq("id", first.id)
+          .select(),
+      );
+      denied(
+        "update paper_trades.cash_balance_after",
+        await a
+          .from("paper_trades")
+          .update({ cash_balance_after: 999999 })
+          .eq("id", first.id)
+          .select(),
+      );
+      denied(
+        "anon insert paper_trades",
+        await plainClient()
+          .from("paper_trades")
+          .insert({
+            user_id: userA(),
+            asset_id: need(I.btcId, "BTC asset"),
+            side: "BUY",
+            entry_price: 1,
+            quantity: 1,
+            status: "OPEN",
+            idempotency_key: smokeIdempotencyKey("anon"),
+            cash_balance_after: 1,
+          })
+          .select(),
+      );
+      assert(
+        JSON.stringify(await rowsForKey(userA(), key)) === JSON.stringify(before),
+        "a keyed trade row changed",
+      );
+    },
+  );
+
+  await check(
+    "I8c",
+    "immutability holds for service_role too: idempotency_key and cash_balance_after cannot be changed",
+    async () => {
+      const key = need(I.key1, "first key");
+      const first = need(I.first, "first open");
+      const before = await rowsForKey(userA(), key);
+      const r1 = await admin
+        .from("paper_trades")
+        .update({ idempotency_key: smokeIdempotencyKey("swap") })
+        .eq("id", first.id)
+        .select();
+      assert(r1.error, "service_role changed idempotency_key");
+      const r2 = await admin
+        .from("paper_trades")
+        .update({ cash_balance_after: 123456 })
+        .eq("id", first.id)
+        .select();
+      assert(r2.error, "service_role changed cash_balance_after");
+      assert(
+        JSON.stringify(await rowsForKey(userA(), key)) === JSON.stringify(before),
+        "a keyed trade row changed",
+      );
+    },
+  );
+
+  await check(
+    "I9",
+    "replay AFTER the trade is closed (C2's trade, store level): original receipt returned, no new trade, no debit",
+    async () => {
+      const params = need(ctx.openParams, "C2 open params");
+      const before = await snap(userA());
+      const res = await store.openTrade(params);
+      assert(res.ok, `replay was refused: ${res.ok ? "" : res.reason}`);
+      assert(res.replayed === true, "a repeat of C2's request must be a replay");
+      assert(res.tradeId === ctx.tradeId, "the replay returned a different trade");
+      sameAmount(
+        res.cashBalanceAfter,
+        need(ctx.cashAfterOpen, "cash after open"),
+        "replayed cashBalanceAfter (the receipt balance at open time, not today's balance)",
+      );
+      sameSnap("after replaying a closed trade's open", before, await snap(userA()));
+    },
+  );
+
   // ── Cleanup: disable ONLY the users this run created. Financial records are never deleted. ──
   await check("X1", "disable (ban) the disposable test users; records are kept", async () => {
     for (const id of [ctx.userA, ctx.userB]) {
@@ -851,10 +1503,13 @@ async function main(): Promise<number> {
 }
 
 function summarise(artifactPath: string, note: string): void {
-  const n = (o: Outcome) => checks.filter((c) => c.outcome === o).length;
-  console.log(
-    `\n${n("PASS")} passed, ${n("FAIL")} failed, ${n("BLOCKED")} blocked.  Artifact: ${artifactPath}`,
-  );
+  const t = tally(checks);
+  console.log(`\n${formatTally(t)}\nArtifact: ${artifactPath}`);
+  if (t.blocked > 0) {
+    console.log(
+      "BLOCKED checks did NOT run to a verdict. The phase is not validated until they are resolved and re-run.",
+    );
+  }
   console.log(note);
   console.log(
     "This is a LIVE run against the declared staging project only if every check above ran against it; local PostgreSQL tests are not Supabase verification.",
