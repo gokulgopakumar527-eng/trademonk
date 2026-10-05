@@ -1,0 +1,17 @@
+node_modules
+.next
+out
+coverage
+next-env.d.ts
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.vercel
+.DS_Store
+supabase/.temp
+supabase/.branches
+
+# Staging smoke-test artifacts (ids only, no secrets) and local probe scratch
+smoke-artifacts/
+.probe/
