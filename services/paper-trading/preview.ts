@@ -14,7 +14,7 @@ import { simulateLongEntry } from "./execution";
 import { SCALE, formatScaled, scaledToNumber } from "./money";
 import { assessQuoteForValuation } from "./portfolio";
 import type { PaperTradingDeps } from "./ports";
-import { openPaperTradeInputSchema } from "./schemas";
+import { previewPaperTradeInputSchema } from "./schemas";
 import { isOpenablePaperSide, type OpenTradeEstimate } from "./types";
 
 const TEXT: Record<PaperTradeRejectionReason, string> = {
@@ -29,6 +29,7 @@ const TEXT: Record<PaperTradeRejectionReason, string> = {
   MOCK_DATA_NOT_ALLOWED: "Only mock data is available, which is not allowed here.",
   DATA_INCONSISTENT: "Market data was inconsistent, so no estimate can be shown.",
   INSUFFICIENT_PAPER_CASH: "Not enough paper cash for this trade.", // never produced here; keeps the map exhaustive
+  IDEMPOTENCY_KEY_REUSED: "Not applicable here.", // never produced here; keeps the map exhaustive
 };
 
 const reject = (reason: PaperTradeRejectionReason, detail?: Record<string, unknown>): never => {
@@ -46,7 +47,7 @@ export async function previewOpenPaperTrade(
   if (typeof userId !== "string" || !UUID.test(userId)) {
     throw new AppError("UNAUTHENTICATED", "Sign in to continue");
   }
-  const parsed = openPaperTradeInputSchema.safeParse(rawInput);
+  const parsed = previewPaperTradeInputSchema.safeParse(rawInput);
   if (!parsed.success) throw new AppError("VALIDATION", parsed.error.issues[0]?.message ?? "Invalid request");
   const { assetId, side, quantity } = parsed.data;
   if (!isOpenablePaperSide(side)) return reject("SIDE_NOT_SUPPORTED", { side });

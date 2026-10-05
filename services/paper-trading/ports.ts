@@ -37,6 +37,24 @@ export interface OpenTradeStoreParams {
   slippageBps: string;
   feeBps: string;
   quote: { source: string; asOf: string; fetchedAt: string; isMock: boolean };
+  /** One per user intent; a retry of the same intended open reuses it. Validated by the input schema. */
+  idempotencyKey: string;
+}
+
+/** The stored trade, as the database recorded it. Present on every successful open; used for replays. */
+export interface StoredOpenReceipt {
+  assetId: string;
+  side: string;
+  quantity: string;
+  entryPrice: string;
+  fee: string;
+  referencePrice: string;
+  notional: string;
+  cashDebited: string;
+  slippageBps: string;
+  feeBps: string;
+  simVersion: string;
+  quote: { source: string; asOf: string; fetchedAt: string; isMock: boolean };
 }
 
 export type OpenTradeStoreResult =
@@ -46,8 +64,11 @@ export type OpenTradeStoreResult =
       openedAt: string;
       currency: string;
       cashBalanceAfter: string;
+      /** true: the key was already used for this same trade; nothing new was created or debited. */
+      replayed: boolean;
+      stored: StoredOpenReceipt;
     }
-  | { ok: false; reason: "INSUFFICIENT_PAPER_CASH" | "ASSET_NOT_FOUND" };
+  | { ok: false; reason: "INSUFFICIENT_PAPER_CASH" | "ASSET_NOT_FOUND" | "IDEMPOTENCY_KEY_REUSED" };
 
 /**
  * What the close flow reads about a trade before pricing it. Exact decimal STRINGS (never floats):

@@ -3,7 +3,7 @@ import type { Asset } from "@/services/market-data/types";
 import type { PaperTradingDeps } from "@/services/paper-trading/ports";
 import { createPaperTradingService } from "@/services/paper-trading/paper-trading-service";
 import type { Quote } from "@/types/market";
-import { ALICE, BTC, BTC_ID, NIFTY, NOW, RELIANCE, fakeStore, freshView, makeDeps, quote } from "./open-helpers";
+import { ALICE, BTC, BTC_ID, NIFTY, NOW, RELIANCE, fakeStore, freshView, makeDeps, nextKey, quote } from "./open-helpers";
 
 export const NSE_QUOTE = (price: number) => quote({ market: "NSE", symbol: "RELIANCE", currency: "INR", price });
 
@@ -39,7 +39,7 @@ export function makeCloseCtx(opts: {
     setPrice: (price: number, over: Partial<Quote> = {}) => { current = freshView(quote({ price, ...over })); },
     /** Opens a BUY of `qty` BTC at the current quote and returns its trade id. */
     openBtc: async (userId = ALICE, qty: number | string = 2) =>
-      (await service.openTrade(userId, { assetId: BTC_ID, side: "BUY", quantity: qty })).id,
+      (await service.openTrade(userId, { assetId: BTC_ID, side: "BUY", quantity: qty, idempotencyKey: nextKey() })).id,
   };
 }
 

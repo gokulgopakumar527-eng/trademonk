@@ -2,7 +2,7 @@ import { PAPER_EXECUTION_LIMITS, PAPER_SIMULATION } from "@/config/paper-trading
 import type { DataView } from "@/services/market-data/market-data-service";
 import type { Asset } from "@/services/market-data/types";
 import type {
-  ClosedTradePage, CloseTradeStoreParams, CloseTradeStoreResult, OpenTradeStoreParams, OpenTradeStoreResult, PaperTradingDeps, PaperTradingStore, PortfolioSnapshot,
+  ClosedTradePage, CloseTradeStoreParams, CloseTradeStoreResult, OpenTradeStoreParams, OpenTradeStoreResult, PaperTradingDeps, PaperTradingStore, PortfolioSnapshot, StoredOpenReceipt,
 } from "@/services/paper-trading/ports";
 import type { Quote } from "@/types/market";
 
@@ -11,6 +11,12 @@ export const BOB = "bbbbbbbb-0000-4000-8000-000000000002";
 export const BTC_ID = "dddddddd-0000-4000-8000-000000000001";
 export const RELIANCE_ID = "dddddddd-0000-4000-8000-000000000002";
 export const NIFTY_ID = "dddddddd-0000-4000-8000-000000000003";
+
+/** A valid idempotency key (16-128 chars of A-Za-z0-9._-). */
+export const KEY = "test-intent-key-0000000001";
+let keySeq = 0;
+/** A fresh, valid key: use for setup opens that are separate intents. */
+export const nextKey = (): string => `setup-intent-key-${String(++keySeq).padStart(10, "0")}`;
 
 export const NOW = new Date("2026-10-01T10:00:00.000Z");
 const iso = (msBefore: number) => new Date(NOW.getTime() - msBefore).toISOString();
@@ -40,7 +46,14 @@ const toUnits = (s: string): Cents => BigInt(s.replace(".", ""));
 export const fmt8 = (c: Cents): string => `${c < 0n ? "-" : ""}${(c < 0n ? -c : c) / 100_000_000n}.${((c < 0n ? -c : c) % 100_000_000n).toString().padStart(8, "0")}`;
 const roundDiv = (num: bigint, den: bigint): bigint => (2n * num + den) / (2n * den); // half-up, non-negative
 
-export interface FakeTrade extends OpenTradeStoreParams { id: string; currency: string; cashDebited: Cents; status: "OPEN" | "CLOSED" }
+export interface FakeTrade extends OpenTradeStoreParams { id: string; currency: string; cashDebited: Cents; status: "OPEN" | "CLOSED"; cashBalanceAfter: string }
+
+/** The receipt the real RPC would return for a stored trade (its ORIGINAL values, whatever the quote is now). */
+const storedReceipt = (t: FakeTrade): StoredOpenReceipt => ({
+  assetId: t.assetId, side: t.side, quantity: t.quantity, entryPrice: t.entryPrice, fee: t.fee,
+  referencePrice: t.referencePrice, notional: fmt8((toUnits(t.entryPrice) * toUnits(t.quantity) + 50_000_000n) / 100_000_000n),
+  cashDebited: fmt8(t.cashDebited), slippageBps: t.slippageBps, feeBps: t.feeBps, simVersion: t.simVersion, quote: t.quote,
+});
 export interface FakeResult extends CloseTradeStoreParams { tradeId: string; closedAt: string; cashCredited: Cents; pnlUnits: Cents }
 
 export interface FakeStoreState {
@@ -78,6 +91,17 @@ export function fakeStore(
     },
     async openTrade(p): Promise<OpenTradeStoreResult> {
       calls.push(p);
+      // Mirrors open_paper_trade(): a known (user, key) replays the stored receipt, or is refused if the trade differs.
+      const prior = state.trades.find((t) => t.userId === p.userId && t.idempotencyKey === p.idempotencyKey);
+      if (prior) {
+        if (prior.assetId !== p.assetId || prior.side !== p.side || toUnits(prior.quantity) !== toUnits(p.quantity)) {
+          return { ok: false, reason: "IDEMPOTENCY_KEY_REUSED" };
+        }
+        return {
+          ok: true, tradeId: prior.id, openedAt: NOW.toISOString(), currency: prior.currency, replayed: true,
+          cashBalanceAfter: prior.cashBalanceAfter, stored: storedReceipt(prior),
+        };
+      }
       const asset = assets.find((a) => a.id === p.assetId);
       if (!asset) return { ok: false, reason: "ASSET_NOT_FOUND" };
       const key = `${p.userId}:${asset.currency}`;
@@ -94,10 +118,12 @@ export function fakeStore(
         acct.balance -= cost;
         if (opts.failInsert) throw new Error("insert failed");
         const id = `00000000-0000-4000-8000-${String(state.trades.length + 1).padStart(12, "0")}`;
-        state.trades.push({ ...p, id, currency: asset.currency, cashDebited: cost, status: "OPEN" });
+        const cashBalanceAfter = `${acct.balance / 100_000_000n}.${(acct.balance % 100_000_000n).toString().padStart(8, "0")}`;
+        const trade: FakeTrade = { ...p, id, currency: asset.currency, cashDebited: cost, status: "OPEN", cashBalanceAfter };
+        state.trades.push(trade);
         return {
-          ok: true, tradeId: id, openedAt: NOW.toISOString(), currency: asset.currency,
-          cashBalanceAfter: `${acct.balance / 100_000_000n}.${(acct.balance % 100_000_000n).toString().padStart(8, "0")}`,
+          ok: true, tradeId: id, openedAt: NOW.toISOString(), currency: asset.currency, replayed: false,
+          cashBalanceAfter, stored: storedReceipt(trade),
         };
       } catch (e) {
         state.accounts.clear();

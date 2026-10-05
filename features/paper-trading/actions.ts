@@ -9,7 +9,7 @@ import type { ClosePaperTradeResult, OpenPaperTradeResult, PreviewPaperTradeResu
 
 /**
  * Opens a simulated paper trade for the signed-in user. PAPER TRADING — SIMULATION ONLY.
- * Accepts only { assetId, side, quantity }. The user id comes from the verified session; the
+ * Accepts only { assetId, side, quantity, idempotencyKey }. The user id comes from the verified session; the
  * execution price, fee, slippage, timestamps and cash are produced by the server and database, and
  * any extra field is rejected by the strict schema inside the service.
  */

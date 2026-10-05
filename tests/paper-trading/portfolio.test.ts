@@ -5,7 +5,7 @@ import { PAPER_SIMULATION } from "@/config/paper-trading";
 import { AppError } from "@/lib/errors";
 import type { PortfolioSnapshot } from "@/services/paper-trading/ports";
 import { parseSignedDecimalAmount } from "@/services/paper-trading/money";
-import { ALICE, BOB, BTC, NOW, RELIANCE, errorView, freshView, quote } from "./open-helpers";
+import { ALICE, BOB, BTC, NOW, RELIANCE, errorView, freshView, nextKey, quote } from "./open-helpers";
 import { NSE_QUOTE, makeCloseCtx, type CloseCtx } from "./close-helpers";
 
 const cur = (p: Awaited<ReturnType<CloseCtx["service"]["getPortfolio"]>>, c: string) => p.currencies.find((x) => x.currency === c)!;
@@ -68,7 +68,7 @@ describe("portfolio: empty and open positions", () => {
     const c = makeCloseCtx();
     await c.openBtc(ALICE, 1);
     c.setQuote(freshView(NSE_QUOTE(2500)));
-    await c.service.openTrade(ALICE, { assetId: RELIANCE.id, side: "LONG", quantity: 3 });
+    await c.service.openTrade(ALICE, { assetId: RELIANCE.id, side: "LONG", quantity: 3, idempotencyKey: nextKey() });
     const p = await c.service.getPortfolio(ALICE);
     expect(cur(p, "USDT").openPositionCount).toBe(1);
     expect(cur(p, "INR").openPositionCount).toBe(1);
@@ -197,7 +197,7 @@ describe("portfolio: unavailable, stale, invalid, mock and mismatched quotes", (
     const c = makeCloseCtx();
     await c.openBtc(ALICE, 1);
     c.setQuote(freshView(NSE_QUOTE(2500)));
-    await c.service.openTrade(ALICE, { assetId: RELIANCE.id, side: "BUY", quantity: 2 });
+    await c.service.openTrade(ALICE, { assetId: RELIANCE.id, side: "BUY", quantity: 2, idempotencyKey: nextKey() });
     c.deps.marketData.getQuote = async (a) => (a.id === BTC.id ? errorView() : freshView(NSE_QUOTE(2600)));
     const p = await c.service.getPortfolio(ALICE);
     expect(cur(p, "USDT")).toMatchObject({ valuation: "INCOMPLETE", equity: null });

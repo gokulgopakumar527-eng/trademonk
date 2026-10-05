@@ -46,6 +46,7 @@ const REJECT_TEXT: Record<PaperTradeAnyRejectionReason, string> = {
   MOCK_DATA_NOT_ALLOWED: "Only mock data is available, which is not allowed here. The paper trade remains open.",
   DATA_INCONSISTENT: "Market data was inconsistent, so the paper trade was not closed. It remains open.",
   INSUFFICIENT_PAPER_CASH: "Not enough paper cash. Nothing was changed.", // never produced by a close; keeps the map exhaustive
+  IDEMPOTENCY_KEY_REUSED: "Not applicable here.", // never produced here; keeps the map exhaustive
 };
 
 const reject = (reason: PaperTradeAnyRejectionReason, detail?: Record<string, unknown>): never => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PaperTradeRejectedError } from "@/services/paper-trading/errors";
 import { createPaperTradingService } from "@/services/paper-trading/paper-trading-service";
-import { ALICE, BTC_ID, NIFTY_ID, NOW, RELIANCE_ID, errorView, freshView, makeDeps, quote } from "./open-helpers";
+import { ALICE, BTC_ID, NIFTY_ID, NOW, RELIANCE_ID, errorView, freshView, makeDeps, nextKey, quote } from "./open-helpers";
 
 const svc = (over: Parameters<typeof makeDeps>[0] = {}) => {
   const c = makeDeps(over);
@@ -27,7 +27,7 @@ describe("previewOpenTrade (read-only estimate)", () => {
   it("matches what openTrade actually charges for the same quote", async () => {
     const { service } = svc();
     const e = await service.previewOpenTrade(ALICE, { assetId: BTC_ID, side: "LONG", quantity: "0.5" });
-    const t = await service.openTrade(ALICE, { assetId: BTC_ID, side: "LONG", quantity: "0.5" });
+    const t = await service.openTrade(ALICE, { assetId: BTC_ID, side: "LONG", quantity: "0.5", idempotencyKey: nextKey() });
     expect(Number(e.estimatedTotalCost)).toBeCloseTo(t.cashDebited, 8);
     expect(Number(e.estimatedFillPrice)).toBeCloseTo(t.entryPrice, 8);
   });

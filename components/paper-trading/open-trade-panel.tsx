@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { openPaperTradeAction, previewPaperTradeAction } from "@/features/paper-trading/actions";
+import { openIntentFingerprint, resolveOpenIntent, type OpenIntent } from "@/features/paper-trading/idempotency";
 import { PAPER_BANNER_TEXT, PAPER_RESULTS_DISCLAIMER, PAPER_SIDES_NOTE } from "@/features/paper-trading/copy";
 import { fmtDateTime, fmtPrice, fmtQuantity, numberToDecimalText } from "@/features/paper-trading/format";
 import type { OpenedPaperTrade, OpenTradeEstimate } from "@/features/paper-trading/state";
@@ -33,7 +34,8 @@ function checkQuantity(raw: string, wholeOnly: boolean): string | undefined {
 
 /**
  * Open a simulated BUY/LONG position from an asset page. The browser sends only { assetId, side,
- * quantity }. The estimate and the final fill are both produced by the server from a gated quote,
+ * quantity, idempotencyKey }. One trade intent keeps ONE key across double clicks, re-renders and
+ * retries; a changed side/quantity or a finished trade starts a new intent with a new key. The estimate and the final fill are both produced by the server from a gated quote,
  * with simulated slippage and fees; nothing here calculates a price, fee or balance.
  */
 export function OpenTradePanel({ assetId, symbol, currency, wholeUnitsOnly }: Props) {
@@ -44,6 +46,9 @@ export function OpenTradePanel({ assetId, symbol, currency, wholeUnitsOnly }: Pr
   const [opened, setOpened] = useState<OpenedPaperTrade | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, start] = useTransition();
+  // The current trade intent. A ref, so a re-render never regenerates the key.
+  const intent = useRef<OpenIntent | null>(null);
+  const inFlight = useRef(false);
 
   const invalidate = () => { setEstimate(null); setError(null); setFieldError(undefined); };
 
@@ -61,12 +66,29 @@ export function OpenTradePanel({ assetId, symbol, currency, wholeUnitsOnly }: Pr
   };
 
   const open = () => {
-    if (pending || !estimate) return;
+    if (pending || inFlight.current || !estimate) return;
+    inFlight.current = true;
     setError(null);
+    // Same side/quantity -> same intent -> same key (a retry); anything else -> a new key.
+    const current = resolveOpenIntent(intent.current, openIntentFingerprint({ assetId, side, quantity }));
+    intent.current = current;
     start(async () => {
-      const res = await openPaperTradeAction({ assetId, side, quantity: quantity.trim() });
-      if (res.ok) { setOpened(res.trade); setEstimate(null); }
-      else setError(res.error);
+      try {
+        const res = await openPaperTradeAction({ assetId, side, quantity: quantity.trim(), idempotencyKey: current.key });
+        if (res.ok) {
+          setOpened(res.trade);
+          setEstimate(null);
+          intent.current = null; // done: the next trade is a new intent
+        } else {
+          if (res.reason === "IDEMPOTENCY_KEY_REUSED") intent.current = null;
+          setError(res.error);
+        }
+      } catch {
+        // Network/server failure: the outcome is unknown, so KEEP the key and let a retry replay it safely.
+        setError("We could not confirm whether the paper trade was opened. Try again: it will not open twice.");
+      } finally {
+        inFlight.current = false;
+      }
     });
   };
 
@@ -81,7 +103,7 @@ export function OpenTradePanel({ assetId, symbol, currency, wholeUnitsOnly }: Pr
 
       {opened ? (
         <div role="status" className="mt-4 space-y-2 text-sm">
-          <p className="font-medium">Paper position opened (simulated)</p>
+          <p className="font-medium">{opened.replayed ? "Paper position already opened (simulated). No second trade was made." : "Paper position opened (simulated)"}</p>
           <dl className="grid max-w-sm grid-cols-2 gap-x-4 gap-y-1">
             <dt className="text-muted">Quantity</dt>
             <dd className="tabular-nums">{fmtQuantity(dec(opened.quantity)) ?? "Unavailable"}</dd>

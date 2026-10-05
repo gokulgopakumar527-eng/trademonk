@@ -71,6 +71,7 @@ const openParams = {
   slippageBps: "5.000",
   feeBps: "10.000",
   quote,
+  idempotencyKey: "intent-key-0123456789abcdef",
 };
 const closeParams = {
   userId: "u",
@@ -84,6 +85,18 @@ const closeParams = {
   feeBps: "10.000",
   quote,
 };
+/** What open_paper_trade() returns: the stored row (to_jsonb), the currency, the receipt balance and `replayed`. */
+const openPayload = (replayed: boolean) => ({
+  trade: {
+    id: "t1", opened_at: "2026-10-03T07:04:07.8+00:00", asset_id: "a", side: "BUY", quantity: 0.12345678,
+    entry_price: 61265.18517407, fees: 7.56360249, reference_price: 61234.56789012, notional: 7563.60249,
+    cash_debited: 7571.16609249, slippage_bps: 5, fee_bps: 10, sim_version: "PAPER_SIM_V1", quote_source: "s",
+    quote_as_of: "2026-10-03T00:00:00+00:00", quote_fetched_at: "2026-10-03T00:00:01+00:00", quote_is_mock: true,
+  },
+  currency: "USDT",
+  cash_balance_after: "2428.83390982",
+  replayed,
+});
 const store = new SupabasePaperTradingStore();
 
 beforeEach(() => {
@@ -94,20 +107,15 @@ beforeEach(() => {
 
 describe("SupabasePaperTradingStore ↔ PostgREST contract (local, faked client)", () => {
   it("sends exact-decimal STRINGS under the RPC's parameter names and parses the jsonb payload", async () => {
-    rpcResult = {
-      data: {
-        trade: { id: "t1", opened_at: "2026-10-03T07:04:07.8+00:00" },
-        currency: "USDT",
-        cash_balance_after: "2428.83390982",
-      },
-      error: null,
-    };
+    rpcResult = { data: openPayload(false), error: null };
     expect(await store.openTrade(openParams)).toEqual({
       ok: true,
       tradeId: "t1",
       openedAt: "2026-10-03T07:04:07.8+00:00",
       currency: "USDT",
       cashBalanceAfter: "2428.83390982",
+      replayed: false,
+      stored: expect.objectContaining({ assetId: "a", side: "BUY", quantity: "0.12345678", fee: "7.56360249", simVersion: "PAPER_SIM_V1" }),
     });
     const c = calls.find((x) => x.rpc === "open_paper_trade")!;
     expect(c.args).toMatchObject({
@@ -116,12 +124,14 @@ describe("SupabasePaperTradingStore ↔ PostgREST contract (local, faked client)
       p_fee: "7.56360249",
       p_starting_cash: "10000.00000000",
       p_quote_is_mock: true,
+      p_idempotency_key: "intent-key-0123456789abcdef",
     });
     expect(Object.keys(c.args as object).sort()).toEqual([
       "p_asset_id",
       "p_entry_price",
       "p_fee",
       "p_fee_bps",
+      "p_idempotency_key",
       "p_quantity",
       "p_quote_as_of",
       "p_quote_fetched_at",
@@ -136,6 +146,26 @@ describe("SupabasePaperTradingStore ↔ PostgREST contract (local, faked client)
     ]);
     for (const v of Object.values(c.args as Record<string, unknown>))
       expect(typeof v === "number").toBe(false);
+  });
+
+  it("passes the 16th argument through unchanged, and nothing but the key is added to the 15-argument call", async () => {
+    rpcResult = { data: openPayload(false), error: null };
+    await store.openTrade({ ...openParams, idempotencyKey: "Another.key_0123456789-XYZ" });
+    const args = calls.find((x) => x.rpc === "open_paper_trade")!.args as Record<string, unknown>;
+    expect(Object.keys(args)).toHaveLength(16);
+    expect(args.p_idempotency_key).toBe("Another.key_0123456789-XYZ");
+  });
+
+  it("reports a replay as replayed: true with the STORED values, not a second trade", async () => {
+    rpcResult = { data: openPayload(true), error: null };
+    expect(await store.openTrade(openParams)).toMatchObject({ ok: true, replayed: true, tradeId: "t1", stored: { entryPrice: "61265.18517407", cashDebited: "7571.16609249" } });
+  });
+
+  it("maps a reused key (different asset/side/quantity) to a business outcome, not a raw database error", async () => {
+    rpcResult = { data: null, error: { message: "PAPER_IDEMPOTENCY_KEY_REUSED: this key was already used for a different trade", code: "P0001" } };
+    expect(await store.openTrade(openParams)).toEqual({ ok: false, reason: "IDEMPOTENCY_KEY_REUSED" });
+    rpcResult = { data: null, error: { message: "PAPER_INVALID_INPUT: idempotency key is required", code: "P0001" } };
+    await expect(store.openTrade(openParams)).rejects.toMatchObject({ message: expect.stringContaining("PAPER_INVALID_INPUT") });
   });
 
   it("maps coded exceptions to business outcomes and rethrows everything else", async () => {
@@ -179,6 +209,8 @@ describe("SupabasePaperTradingStore ↔ PostgREST contract (local, faked client)
       {},
       { trade: { id: "t" }, currency: "USDT", cash_balance_after: "1" },
       { trade: { id: "t", opened_at: "x" }, currency: "USDT" },
+      { ...openPayload(false), replayed: undefined },
+      { ...openPayload(false), trade: { ...openPayload(false).trade, fees: null } },
     ]) {
       rpcResult = { data, error: null };
       await expect(store.openTrade(openParams)).rejects.toThrow("unexpected payload");

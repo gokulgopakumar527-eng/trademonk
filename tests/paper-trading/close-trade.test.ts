@@ -5,7 +5,7 @@ import { simulateLongExit, realizedLongPnl } from "@/services/paper-trading/exec
 import { PaperTradeRejectedError } from "@/services/paper-trading/errors";
 import { formatSignedScaled, parseQuantity, priceToScaled } from "@/services/paper-trading/money";
 import {
-  ALICE, BOB, BTC, BTC_ID, NIFTY, RELIANCE, RELIANCE_ID, errorView, freshView, fmt8, quote,
+  ALICE, BOB, BTC, BTC_ID, NIFTY, RELIANCE, RELIANCE_ID, errorView, freshView, fmt8, nextKey, quote,
 } from "./open-helpers";
 import { NSE_QUOTE, NOW, makeCloseCtx, type CloseCtx } from "./close-helpers";
 
@@ -81,7 +81,7 @@ describe("close paper trade: realized P&L", () => {
   it("an NSE equity closes in INR under NSE's own assumptions", async () => {
     const c = makeCloseCtx();
     c.setQuote(freshView(NSE_QUOTE(2500.5)));
-    const id = (await c.service.openTrade(ALICE, { assetId: RELIANCE_ID, side: "LONG", quantity: 3 })).id;
+    const id = (await c.service.openTrade(ALICE, { assetId: RELIANCE_ID, side: "LONG", quantity: 3, idempotencyKey: nextKey() })).id;
     c.setQuote(freshView(NSE_QUOTE(2600.5)));
     const r = await c.service.closeTrade(ALICE, { tradeId: id });
     expect(r).toMatchObject({

@@ -96,13 +96,16 @@ describe("layering and client authority", () => {
     const src = service("open-trade.ts");
     expect(src).not.toMatch(/rawInput\./);
     expect(src).not.toMatch(/parsed\.data\.(userId|price|fee|fees|slippage|timestamp|openedAt|cash|balance)/);
-    expect(src).toMatch(/const \{ assetId, side, quantity \} = parsed\.data/);
+    expect(src).toMatch(/const \{ assetId, side, quantity, idempotencyKey \} = parsed\.data/);
   });
-  it("the input schema is strict and names only assetId, side and quantity", () => {
+  it("the input schemas are strict and name only assetId, side, quantity (and the open key)", () => {
     const schema = service("schemas.ts");
-    const block = schema.slice(schema.indexOf("openPaperTradeInputSchema"));
-    expect(block).toMatch(/\.strict\(\)/);
-    expect(block).toMatch(/assetId:[\s\S]*side:[\s\S]*quantity:/);
+    const base = schema.slice(schema.indexOf("export const previewPaperTradeInputSchema"), schema.indexOf("export const IDEMPOTENCY_KEY_PATTERN"));
+    expect(base).toMatch(/\.strict\(\)/);
+    expect(base).toMatch(/assetId:[\s\S]*side:[\s\S]*quantity:/);
+    expect(base).not.toMatch(/price|fee|userId|cash|balance|timestamp|idempotency/i);
+    const block = schema.slice(schema.indexOf("export const openPaperTradeInputSchema"), schema.indexOf("export type OpenPaperTradeInput"));
+    expect(block).toMatch(/previewPaperTradeInputSchema\s*\.extend\(\{ idempotencyKey: idempotencyKeySchema \}\)\s*\.strict\(\)/);
     expect(block).not.toMatch(/price|fee|userId|cash|balance|timestamp/i);
   });
   it("no execution code calls a provider, fetch, Binance or an Indian vendor", () => {

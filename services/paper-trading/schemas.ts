@@ -95,7 +95,7 @@ export const parsePaperTradeResultRow = (raw: unknown): PaperTradeResult =>
  * price, fee, slippage, timestamp, cash or balance is a validation error, never silently ignored.
  * Quantity is parsed to an exact fixed-point amount (max 8 decimals; extra precision is rejected).
  */
-export const openPaperTradeInputSchema = z
+export const previewPaperTradeInputSchema = z
   .object({
     assetId: z.uuid("Choose a valid asset"),
     side: paperTradeSideSchema,
@@ -104,6 +104,26 @@ export const openPaperTradeInputSchema = z
       .refine((v) => parseQuantity(v) !== null, "Quantity must be a positive number with at most 8 decimal places")
       .transform((v) => parseQuantity(v)!),
   })
+  .strict();
+
+/**
+ * One user intent = one idempotency key. Opaque, client-generated randomness: it identifies a retry
+ * of the SAME intended open and is never an authorization mechanism. The format matches the
+ * database CHECK and the open_paper_trade() guard exactly (16-128 chars of A-Z a-z 0-9 . _ -).
+ */
+export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._-]+$/;
+export const idempotencyKeySchema = z
+  .string("A request key is required")
+  .min(16, "Invalid request key")
+  .max(128, "Invalid request key")
+  .regex(IDEMPOTENCY_KEY_PATTERN, "Invalid request key");
+
+/**
+ * The ONLY fields a client may send to open a trade: { assetId, side, quantity, idempotencyKey }.
+ * Strict: a supplied user id, price, fee, balance or execution time is a validation error.
+ */
+export const openPaperTradeInputSchema = previewPaperTradeInputSchema
+  .extend({ idempotencyKey: idempotencyKeySchema })
   .strict();
 
 export type OpenPaperTradeInput = z.output<typeof openPaperTradeInputSchema>;

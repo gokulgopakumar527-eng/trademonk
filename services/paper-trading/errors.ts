@@ -11,7 +11,8 @@ export type PaperTradeRejectionReason =
   | "MARKET_CLOSED"
   | "MOCK_DATA_NOT_ALLOWED"
   | "DATA_INCONSISTENT"
-  | "INSUFFICIENT_PAPER_CASH";
+  | "INSUFFICIENT_PAPER_CASH"
+  | "IDEMPOTENCY_KEY_REUSED";
 
 /** Reasons only the close flow can produce. Kept apart so the open flow's exhaustive maps are unchanged. */
 export type PaperTradeCloseOnlyReason = "TRADE_NOT_FOUND" | "TRADE_ALREADY_CLOSED" | "TRADE_NOT_CLOSABLE";
@@ -33,6 +34,7 @@ const CODE: Record<PaperTradeAnyRejectionReason, AppErrorCode> = {
   MOCK_DATA_NOT_ALLOWED: "PROVIDER_UNAVAILABLE",
   DATA_INCONSISTENT: "PROVIDER_UNAVAILABLE",
   INSUFFICIENT_PAPER_CASH: "VALIDATION",
+  IDEMPOTENCY_KEY_REUSED: "VALIDATION",
 };
 
 /** A paper trade was refused and nothing was created, closed, debited or credited. `message` is safe to show. */

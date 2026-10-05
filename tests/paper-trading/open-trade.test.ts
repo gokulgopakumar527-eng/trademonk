@@ -4,14 +4,14 @@ import { AppError } from "@/lib/errors";
 import { PaperTradeRejectedError } from "@/services/paper-trading/errors";
 import { createPaperTradingService } from "@/services/paper-trading/paper-trading-service";
 import {
-  ALICE, BOB, BTC, BTC_ID, NIFTY_ID, NOW, RELIANCE_ID, errorView, fakeStore, freshView, makeDeps, quote,
+  ALICE, BOB, BTC, BTC_ID, KEY, NIFTY_ID, nextKey, NOW, RELIANCE_ID, errorView, fakeStore, freshView, makeDeps, quote,
 } from "./open-helpers";
 
 const open = (userId: string, input: unknown, over: Parameters<typeof makeDeps>[0] = {}) => {
   const ctx = makeDeps(over);
   return { ctx, run: () => createPaperTradingService(ctx.deps).openTrade(userId, input) };
 };
-const valid = { assetId: BTC_ID, side: "BUY", quantity: 2 };
+const valid = { assetId: BTC_ID, side: "BUY", quantity: 2, idempotencyKey: KEY };
 const rejected = async (p: Promise<unknown>) => {
   const e = await p.then(() => null, (x: unknown) => x);
   expect(e).toBeInstanceOf(PaperTradeRejectedError);
@@ -135,7 +135,7 @@ describe("open paper trade: input validation", () => {
   });
 
   it("equities trade in whole units; crypto may be fractional", async () => {
-    const eq = open(ALICE, { assetId: RELIANCE_ID, side: "BUY", quantity: 1.5 }, { quoteView: freshView(quote({ market: "NSE", symbol: "RELIANCE", currency: "INR", price: 2500 })) });
+    const eq = open(ALICE, { assetId: RELIANCE_ID, side: "BUY", quantity: 1.5, idempotencyKey: KEY }, { quoteView: freshView(quote({ market: "NSE", symbol: "RELIANCE", currency: "INR", price: 2500 })) });
     expect(await rejected(eq.run())).toBe("INVALID_QUANTITY");
     untouched(eq.ctx);
     const cr = open(ALICE, { ...valid, quantity: "0.00000001" });
@@ -244,6 +244,7 @@ describe("open paper trade: a valid trade", () => {
       entryPrice: "100.05000000", fee: "0.20010000", startingCash: "10000",
       simVersion: "PAPER_SIM_V1", referencePrice: "100.00000000", slippageBps: "5.000", feeBps: "10.000",
       quote: { source: "binance-public", asOf: "2026-10-01T09:59:55.000Z", fetchedAt: "2026-10-01T09:59:56.000Z", isMock: false },
+      idempotencyKey: KEY,
     }]);
   });
 
@@ -266,7 +267,7 @@ describe("open paper trade: a valid trade", () => {
   });
 
   it("opens an NSE equity in INR under its own market's assumptions", async () => {
-    const { run } = open(ALICE, { assetId: RELIANCE_ID, side: "BUY", quantity: 3 }, { quoteView: freshView(quote({ market: "NSE", symbol: "RELIANCE", currency: "INR", price: 2500.5 })) });
+    const { run } = open(ALICE, { assetId: RELIANCE_ID, side: "BUY", quantity: 3, idempotencyKey: KEY }, { quoteView: freshView(quote({ market: "NSE", symbol: "RELIANCE", currency: "INR", price: 2500.5 })) });
     expect(await run()).toMatchObject({ currency: "INR", entryPrice: 2501.75025, notional: 7505.25075, fee: 3.75262538, cashBalanceAfter: 1_000_000 - 7509.00337538 });
   });
 
@@ -283,7 +284,7 @@ describe("open paper trade: a valid trade", () => {
     const ctx = makeDeps();
     const svc = createPaperTradingService(ctx.deps);
     await svc.openTrade(ALICE, valid);
-    const second = await svc.openTrade(ALICE, valid);
+    const second = await svc.openTrade(ALICE, { ...valid, idempotencyKey: nextKey() }); // a NEW intent
     expect(second.cashBalanceAfter).toBeCloseTo(10000 - 2 * 200.3001, 8);
   });
 });

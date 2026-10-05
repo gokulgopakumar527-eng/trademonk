@@ -10,7 +10,8 @@ const walk = (dir: string): string[] =>
     const f = path.join(dir, n);
     return statSync(f).isDirectory() ? walk(f) : /\.tsx?$/.test(n) ? [f] : [];
   });
-const rel = (f: string) => path.relative(ROOT, f);
+const rel = (f: string) =>
+  path.relative(ROOT, f).replace(/\\/g, "/");
 const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 const stripSql = (s: string) => s.replace(/--.*$/gm, "");
 

@@ -35,7 +35,7 @@ describe("paper-trading UI: no privileged access", () => {
       const code = strip(readFileSync(f, "utf8"));
       expect(code, f).not.toMatch(/server-only|features\/paper-trading\/server|lib\/rate-limit|profile-service/);
       const imports = [...code.matchAll(/from\s+"(@\/features\/paper-trading\/[^"]+)"/g)].map((m) => m[1]);
-      for (const i of imports) expect(["actions", "copy", "format", "state"].some((n) => i!.endsWith(`/${n}`)), `${f}: ${i}`).toBe(true);
+      for (const i of imports) expect(["actions", "copy", "format", "idempotency", "state"].some((n) => i!.endsWith(`/${n}`)), `${f}: ${i}`).toBe(true);
     }
   });
   it("the page reads data only through the session-scoped loader and takes no search params or ids", () => {
@@ -51,11 +51,11 @@ describe("paper-trading UI: the browser sends no authority and does no accountin
     const calls = [...code.matchAll(/closePaperTradeAction\(([^)]*)\)/g)].map((m) => m[1]!.replace(/\s+/g, " ").trim());
     expect(calls).toEqual(["{ tradeId: p.tradeId }"]);
   });
-  it("the open component sends exactly { assetId, side, quantity } to both the estimate and the open action", () => {
+  it("the estimate sends { assetId, side, quantity }; the open sends the same plus the intent's idempotencyKey", () => {
     const code = strip(read("components/paper-trading/open-trade-panel.tsx"));
     const sig = (name: string) => [...code.matchAll(new RegExp(`${name}\\(([^)]*\\)?[^)]*)\\)`, "g"))].map((m) => m[1]!.replace(/\s+/g, " ").trim());
     expect(sig("previewPaperTradeAction")).toEqual(["{ assetId, side, quantity: quantity.trim() }"]);
-    expect(sig("openPaperTradeAction")).toEqual(["{ assetId, side, quantity: quantity.trim() }"]);
+    expect(sig("openPaperTradeAction")).toEqual(["{ assetId, side, quantity: quantity.trim(), idempotencyKey: current.key }"]);
   });
   it("no UI code names a user id, price, fee, slippage, cash or P&L field in a payload", () => {
     for (const f of clientFiles) {

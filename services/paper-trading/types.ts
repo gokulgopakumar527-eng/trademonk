@@ -71,6 +71,11 @@ export interface OpenedPaperTrade {
   simulation: { version: string; slippageBps: number; feeBps: number };
   quote: { source: string; asOf: string; fetchedAt: string; isMock: boolean };
   openedAt: string;
+  /**
+   * true when this is the receipt of a trade a previous request with the same idempotency key
+   * already opened: no second trade was created and nothing more was debited.
+   */
+  replayed: boolean;
   banner: string;
 }
 

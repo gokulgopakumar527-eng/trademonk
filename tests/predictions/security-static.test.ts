@@ -9,7 +9,8 @@ const walk = (dir: string): string[] =>
     const f = path.join(dir, n);
     return statSync(f).isDirectory() ? walk(f) : /\.tsx?$/.test(n) ? [f] : [];
   });
-const rel = (f: string) => path.relative(ROOT, f);
+const rel = (f: string) =>
+  path.relative(ROOT, f).replace(/\\/g, "/");
 
 const migrationsDir = path.join(ROOT, "supabase/migrations");
 const migrationFiles = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();

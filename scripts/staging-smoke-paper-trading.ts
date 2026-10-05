@@ -370,6 +370,8 @@ async function main(): Promise<number> {
         slippageBps: e.appliedSlippageBps,
         feeBps: e.appliedFeeBps,
         quote,
+        // Minimal compile fix for the 16-argument RPC. Replay/conflict smoke checks belong to Phase 5C-7C-C.
+        idempotencyKey: `smoke-${crypto.randomUUID()}`,
       };
       ctx.openParams = params;
       const res = await store.openTrade(params);

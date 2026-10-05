@@ -25,9 +25,28 @@ interface AssetRow {
 }
 
 interface OpenRpcPayload {
-  trade: { id: string; opened_at: string };
+  trade: {
+    id: string;
+    opened_at: string;
+    asset_id: string;
+    side: string;
+    quantity: string | number;
+    entry_price: string | number;
+    fees: string | number;
+    reference_price: string | number;
+    notional: string | number;
+    cash_debited: string | number;
+    slippage_bps: string | number;
+    fee_bps: string | number;
+    sim_version: string;
+    quote_source: string;
+    quote_as_of: string;
+    quote_fetched_at: string;
+    quote_is_mock: boolean;
+  };
   currency: string;
   cash_balance_after: string;
+  replayed: boolean;
 }
 
 interface CloseRpcPayload {
@@ -119,23 +138,47 @@ export class SupabasePaperTradingStore implements PaperTradingStore {
       p_quote_as_of: p.quote.asOf,
       p_quote_fetched_at: p.quote.fetchedAt,
       p_quote_is_mock: p.quote.isMock,
+      p_idempotency_key: p.idempotencyKey,
     });
     if (error) {
       // Expected business outcomes raise a coded exception; the transaction has already rolled back.
+      if (error.message?.includes("PAPER_IDEMPOTENCY_KEY_REUSED")) return { ok: false, reason: "IDEMPOTENCY_KEY_REUSED" };
       if (error.message?.includes("PAPER_INSUFFICIENT_CASH")) return { ok: false, reason: "INSUFFICIENT_PAPER_CASH" };
       if (error.message?.includes("PAPER_ASSET_NOT_FOUND")) return { ok: false, reason: "ASSET_NOT_FOUND" };
       throw error;
     }
     const payload = data as OpenRpcPayload | null;
-    if (!payload?.trade?.id || !payload.trade.opened_at || !payload.currency || payload.cash_balance_after == null) {
+    const t = payload?.trade;
+    if (
+      !t?.id || !t.opened_at || !t.asset_id || !t.side || !t.sim_version || !t.quote_source ||
+      !t.quote_as_of || !t.quote_fetched_at || typeof t.quote_is_mock !== "boolean" ||
+      t.quantity == null || t.entry_price == null || t.fees == null || t.reference_price == null ||
+      t.notional == null || t.cash_debited == null || t.slippage_bps == null || t.fee_bps == null ||
+      !payload?.currency || payload.cash_balance_after == null || typeof payload.replayed !== "boolean"
+    ) {
       throw new Error("open_paper_trade returned an unexpected payload");
     }
     return {
       ok: true,
-      tradeId: payload.trade.id,
-      openedAt: payload.trade.opened_at,
+      tradeId: t.id,
+      openedAt: t.opened_at,
       currency: payload.currency,
       cashBalanceAfter: payload.cash_balance_after,
+      replayed: payload.replayed,
+      stored: {
+        assetId: t.asset_id,
+        side: t.side,
+        quantity: String(t.quantity),
+        entryPrice: String(t.entry_price),
+        fee: String(t.fees),
+        referencePrice: String(t.reference_price),
+        notional: String(t.notional),
+        cashDebited: String(t.cash_debited),
+        slippageBps: String(t.slippage_bps),
+        feeBps: String(t.fee_bps),
+        simVersion: t.sim_version,
+        quote: { source: t.quote_source, asOf: t.quote_as_of, fetchedAt: t.quote_fetched_at, isMock: t.quote_is_mock },
+      },
     };
   }
   async getTradeForClose(userId: string, tradeId: string): Promise<CloseCandidate | null> {

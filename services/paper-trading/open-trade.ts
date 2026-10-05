@@ -4,7 +4,7 @@
  * Flow:  verified user -> strict input -> asset -> market-data facade quote (gated) ->
  *        simulated execution (config-driven fixed-point) -> ONE atomic database call.
  *
- * The browser supplies only { assetId, side, quantity }. The execution price, fee, slippage,
+ * The browser supplies only { assetId, side, quantity, idempotencyKey }. The execution price, fee, slippage,
  * timestamps, user identity and cash are all produced here or in the database. Nothing in this file
  * reaches a provider, `fetch`, or the database directly.
  */
@@ -31,6 +31,7 @@ const REJECT_TEXT: Record<PaperTradeRejectionReason, string> = {
   MOCK_DATA_NOT_ALLOWED: "Only mock data is available, which is not allowed here. No paper trade was opened.",
   DATA_INCONSISTENT: "Market data was inconsistent, so no paper trade was opened.",
   INSUFFICIENT_PAPER_CASH: "Not enough paper cash for this trade (including simulated fees). No trade was opened.",
+  IDEMPOTENCY_KEY_REUSED: "This request was already used for a different trade. Review the details and try again. No trade was opened.",
 };
 
 const reject = (reason: PaperTradeRejectionReason, detail?: Record<string, unknown>): never => {
@@ -50,12 +51,12 @@ export async function openPaperTrade(
     throw new AppError("UNAUTHENTICATED", "Sign in to continue");
   }
 
-  // 1. Strict input: anything beyond { assetId, side, quantity } is a validation error.
+  // 1. Strict input: anything beyond { assetId, side, quantity, idempotencyKey } is a validation error.
   const parsed = openPaperTradeInputSchema.safeParse(rawInput);
   if (!parsed.success) {
     throw new AppError("VALIDATION", parsed.error.issues[0]?.message ?? "Invalid request");
   }
-  const { assetId, side, quantity } = parsed.data;
+  const { assetId, side, quantity, idempotencyKey } = parsed.data;
   if (!isOpenablePaperSide(side)) return reject("SIDE_NOT_SUPPORTED", { side });
 
   // 2. The asset must exist and be tradable in the simulation.
@@ -106,12 +107,39 @@ export async function openPaperTrade(
       slippageBps: fill.appliedSlippageBps,
       feeBps: fill.appliedFeeBps,
       quote: { source: q.data.source, asOf: q.data.asOf, fetchedAt: q.data.fetchedAt, isMock: q.data.isMock },
+      idempotencyKey,
     });
   } catch (error) {
     logger.error("paper_trade.open_failed", { error, assetId });
     throw new AppError("INTERNAL", "Could not open the paper trade. Nothing was changed.", error);
   }
   if (!stored.ok) return reject(stored.reason, { assetId });
+
+  // 5b. Replay: this key already opened this exact trade. Return the STORED receipt - never the
+  //     fill just computed from a fresh quote - and do nothing else: no second audit, no new debit.
+  if (stored.replayed) {
+    logger.info("paper_trade.open_replayed", { tradeId: stored.tradeId });
+    const r = stored.stored;
+    return {
+      id: stored.tradeId,
+      assetId: r.assetId,
+      side,
+      status: "OPEN",
+      quantity: Number(r.quantity),
+      referencePrice: Number(r.referencePrice),
+      entryPrice: Number(r.entryPrice),
+      notional: Number(r.notional),
+      fee: Number(r.fee),
+      cashDebited: Number(r.cashDebited),
+      currency: stored.currency,
+      cashBalanceAfter: Number(stored.cashBalanceAfter),
+      simulation: { version: r.simVersion, slippageBps: Number(r.slippageBps), feeBps: Number(r.feeBps) },
+      quote: r.quote,
+      openedAt: stored.openedAt,
+      replayed: true,
+      banner: PAPER_TRADING_BANNER,
+    };
+  }
 
   // 6. Audit is best-effort and happens after the commit: an audit failure must not turn a
   //    committed trade into an error the user would retry (and double-open).
@@ -153,6 +181,7 @@ export async function openPaperTrade(
     simulation: { version: deps.config.version, slippageBps: Number(fill.appliedSlippageBps), feeBps: Number(fill.appliedFeeBps) },
     quote: { source: q.data.source, asOf: q.data.asOf, fetchedAt: q.data.fetchedAt, isMock: q.data.isMock },
     openedAt: stored.openedAt,
+    replayed: false,
     banner: PAPER_TRADING_BANNER,
   };
 }
