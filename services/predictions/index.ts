@@ -4,10 +4,10 @@ import { getMarketDataService } from "@/services/market-data";
 import { writeAuditLog } from "@/services/audit/audit-service";
 import { createEnginePrediction } from "./prediction-service";
 import { SupabasePredictionStore } from "./supabase-store";
-import type { PredictionView } from "./types";
+import type { CreatedPrediction } from "./types";
 
 /** Production wiring. The market data comes only from getMarketDataService(). */
-export function createPredictionForUser(userId: string, rawInput: unknown): Promise<PredictionView> {
+export function createPredictionForUser(userId: string, rawInput: unknown): Promise<CreatedPrediction> {
   return createEnginePrediction(userId, rawInput, {
     marketData: getMarketDataService(),
     store: new SupabasePredictionStore(),

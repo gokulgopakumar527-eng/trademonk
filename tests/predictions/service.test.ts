@@ -80,6 +80,7 @@ function harness(o: {
         inserted.push(row);
         return DB_ROW;
       },
+      findByIdempotencyKey: async () => null,
     },
     audit: async (e) => void audits.push(e),
     now: () => NOW,

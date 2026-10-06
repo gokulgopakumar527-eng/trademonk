@@ -1,5 +1,5 @@
-import type { PredictionView } from "@/services/predictions/types";
+import type { CreatedPrediction } from "@/services/predictions/types";
 
 export type CreatePredictionResult =
-  | { ok: true; prediction: PredictionView }
+  | { ok: true; prediction: CreatedPrediction }
   | { ok: false; error: string; reason?: string };

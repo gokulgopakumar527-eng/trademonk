@@ -13,10 +13,10 @@ import type { DataView } from "@/services/market-data/market-data-service";
 import type { Asset } from "@/services/market-data/types";
 import type { CandleSeries, Quote, Timeframe } from "@/types/market";
 import { generatePrediction, type EngineResult } from "./engine";
-import { PredictionRejectedError } from "./errors";
+import { PredictionIdempotencyConflictError, PredictionRejectedError } from "./errors";
 import { derivePredictionLifecycle } from "./lifecycle";
 import { createPredictionInputSchema } from "./schemas";
-import type { InsertedPredictionRow, NewPredictionRow, PredictionView } from "./types";
+import type { CreatedPrediction, InsertedPredictionRow, NewPredictionRow, StoredPredictionRecord } from "./types";
 
 export interface PredictionMarketData {
   getQuote(asset: Asset): Promise<DataView<Quote>>;
@@ -25,7 +25,10 @@ export interface PredictionMarketData {
 
 export interface PredictionStore {
   getAssetById(id: string): Promise<Asset | null>;
+  /** Throws PredictionIdempotencyConflictError when (user_id, idempotency_key) already exists. */
   insert(row: NewPredictionRow): Promise<InsertedPredictionRow>;
+  /** The user's own prediction for this key, as stored, or null. */
+  findByIdempotencyKey(userId: string, idempotencyKey: string): Promise<StoredPredictionRecord | null>;
 }
 
 export interface PredictionDeps {
@@ -77,12 +80,19 @@ export async function createEnginePrediction(
   userId: string,
   rawInput: unknown,
   deps: PredictionDeps,
-): Promise<PredictionView> {
+): Promise<CreatedPrediction> {
   const parsed = createPredictionInputSchema.safeParse(rawInput);
   if (!parsed.success) {
     throw new AppError("VALIDATION", parsed.error.issues[0]?.message ?? "Invalid request");
   }
-  const { assetId, timeframe } = parsed.data;
+  const { assetId, timeframe, idempotencyKey } = parsed.data;
+  const intent = { assetId, timeframe };
+
+  // 0. Lookup first, before any market call. A retry of an earlier request returns the ORIGINAL stored
+  //    prediction: nothing is re-quoted, recomputed, inserted or audited, so a retry still works when
+  //    the market is closed or the quote is stale.
+  const existing = await findExisting(deps, userId, idempotencyKey);
+  if (existing) return replayOrConflict(existing, intent, deps.now());
 
   const asset = await deps.store.getAssetById(assetId);
   if (!asset) return reject("ASSET_NOT_FOUND", { assetId });
@@ -121,11 +131,20 @@ export async function createEnginePrediction(
   }
 
   // 4. Persist. created_at / expires_at / content_hash are set by the database trigger.
-  const row = toRow(userId, assetId, result, q.data);
+  const row = toRow(userId, idempotencyKey, assetId, result, q.data);
   let inserted: InsertedPredictionRow;
   try {
     inserted = await deps.store.insert(row);
   } catch (error) {
+    if (error instanceof PredictionIdempotencyConflictError) {
+      // Lost a concurrent race on (user_id, idempotency_key): the winner's row is authoritative.
+      const winner = await findExisting(deps, userId, idempotencyKey);
+      if (!winner) {
+        logger.error("prediction.idempotency_race_unresolved", { assetId });
+        throw new AppError("INTERNAL", "Could not save the prediction", error);
+      }
+      return replayOrConflict(winner, intent, deps.now());
+    }
     logger.error("prediction.insert_failed", { error, assetId });
     throw new AppError("INTERNAL", "Could not save the prediction", error);
   }
@@ -146,6 +165,7 @@ export async function createEnginePrediction(
   });
 
   return {
+    replayed: false,
     id: inserted.id,
     assetId,
     direction: result.direction,
@@ -171,9 +191,82 @@ export async function createEnginePrediction(
   };
 }
 
-function toRow(userId: string, assetId: string, r: EngineResult, quote: Quote): NewPredictionRow {
+async function findExisting(
+  deps: PredictionDeps,
+  userId: string,
+  idempotencyKey: string,
+): Promise<StoredPredictionRecord | null> {
+  try {
+    return await deps.store.findByIdempotencyKey(userId, idempotencyKey);
+  } catch (error) {
+    logger.error("prediction.idempotency_lookup_failed", { error });
+    throw new AppError("INTERNAL", "Could not save the prediction", error);
+  }
+}
+
+/**
+ * Same key + same intent (asset, timeframe) = replay of the original. Same key + any other intent =
+ * IDEMPOTENCY_KEY_REUSED. The engine output (direction, levels, horizon) is NOT part of the intent:
+ * it is derived server-side from live data and may legitimately differ on a retry, which is exactly
+ * why the stored row is returned and never recomputed.
+ */
+function replayOrConflict(
+  stored: StoredPredictionRecord,
+  intent: { assetId: string; timeframe: string },
+  now: Date,
+): CreatedPrediction {
+  if (stored.asset_id !== intent.assetId || stored.timeframe !== intent.timeframe) {
+    return reject("IDEMPOTENCY_KEY_REUSED", { predictionId: stored.id });
+  }
+  logger.info("prediction.create_replayed", { predictionId: stored.id });
+  return storedToView(stored, now);
+}
+
+function storedToView(r: StoredPredictionRecord, now: Date): CreatedPrediction {
+  const snap = r.engine_snapshot;
+  if (
+    r.engine_version === null ||
+    r.timeframe === null ||
+    r.entry_reference_price === null ||
+    r.signal_agreement === null ||
+    r.entry_quote_source === null ||
+    r.entry_quote_as_of === null ||
+    r.entry_quote_fetched_at === null ||
+    r.entry_quote_is_mock === null ||
+    !Array.isArray(snap?.signalsUsed) ||
+    !Array.isArray(snap?.reasoning)
+  ) {
+    logger.error("prediction.replay_row_incomplete", { predictionId: r.id });
+    throw new AppError("INTERNAL", "Could not load the saved prediction");
+  }
+  return {
+    replayed: true,
+    id: r.id,
+    assetId: r.asset_id,
+    direction: r.direction,
+    timeframe: r.timeframe as CreatedPrediction["timeframe"],
+    horizonHours: r.horizon_hours,
+    entryReferencePrice: r.entry_reference_price,
+    targetPrice: r.target_price,
+    invalidationPrice: r.invalidation_price,
+    reasoning: snap.reasoning,
+    signalsUsed: snap.signalsUsed,
+    // Only directional predictions are stored, and a direction needs a majority on its own side.
+    signalAgreement: { agreeing: r.signal_agreement, total: 5, side: r.direction },
+    engineVersion: r.engine_version,
+    entryQuote: { source: r.entry_quote_source, asOf: r.entry_quote_as_of, fetchedAt: r.entry_quote_fetched_at, isMock: r.entry_quote_is_mock },
+    createdAt: r.created_at,
+    expiresAt: r.expires_at,
+    contentHash: r.content_hash,
+    hashVersion: r.hash_version,
+    lifecycle: derivePredictionLifecycle({ createdAt: r.created_at, expiresAt: r.expires_at }, now, { evaluated: r.evaluated }),
+  };
+}
+
+function toRow(userId: string, idempotencyKey: string, assetId: string, r: EngineResult, quote: Quote): NewPredictionRow {
   return {
     user_id: userId,
+    idempotency_key: idempotencyKey,
     origin: "USER",
     asset_id: assetId,
     direction: r.direction as "BULLISH" | "BEARISH",
