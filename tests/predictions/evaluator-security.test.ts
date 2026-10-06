@@ -24,7 +24,7 @@ describe("migration 6 keeps the security model intact", () => {
     const later = migrations.slice(migrations.indexOf(m6File) + 1);
     for (const f of later) {
       const sql = stripSql(read("supabase/migrations", f));
-      if (f.endsWith("_prediction_create_idempotency.sql")) {
+      if (f === "20261006000010_prediction_create_idempotency.sql") {
         // 5D-A: the ONLY allowed exception. It may add the key column, its format check and its
         // partial unique index, and nothing else: no function, trigger, policy, grant, revoke or drop.
         expect(sql, f).not.toMatch(/\b(create|drop)\s+(or\s+replace\s+)?(function|trigger|policy)\b|\b(grant|revoke|drop)\b|row\s+level\s+security/i);

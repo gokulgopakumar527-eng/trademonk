@@ -24,7 +24,7 @@ const code = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/
 const ENGINE_COLUMNS = [
   "entry_reference_price", "engine_version", "signal_agreement", "signal_total",
   "entry_quote_source", "entry_quote_as_of", "entry_quote_fetched_at", "entry_quote_is_mock",
-  "engine_snapshot", "hash_version", "created_at", "expires_at", "content_hash",
+  "engine_snapshot", "hash_version", "created_at", "expires_at", "content_hash", "idempotency_key",
 ];
 
 describe("migration 5 keeps the security model intact", () => {
