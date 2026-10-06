@@ -21,10 +21,10 @@ const migStmts = stmts(mig);
 const fnBody = mig.slice(mig.indexOf("create function public.close_paper_trade"));
 
 describe("migration 8: privileges and RLS", () => {
-  it("exists, ordered after the open-trade migration; only the open-idempotency migration follows it", () => {
+  it("exists, ordered after the open-trade migration; only the open-idempotency and prediction-idempotency migrations follow it", () => {
     expect(migFile).toBeDefined();
     expect(all.indexOf(migFile)).toBeGreaterThan(all.findIndex((f) => f.endsWith("_paper_trade_open.sql")));
-    expect(all.slice(all.indexOf(migFile) + 1).map((f) => f.replace(/^\d+_/, ""))).toEqual(["paper_trade_open_idempotency.sql"]);
+    expect(all.slice(all.indexOf(migFile) + 1).map((f) => f.replace(/^\d+_/, ""))).toEqual(["paper_trade_open_idempotency.sql", "prediction_create_idempotency.sql"]);
   });
   it("close_paper_trade() is executable by service_role only", () => {
     expect(mig).toMatch(/revoke execute on function public\.close_paper_trade\([^)]*\) from public, anon, authenticated/i);

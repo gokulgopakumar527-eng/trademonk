@@ -1346,4 +1346,181 @@ begin
   delete from public.paper_trades where user_id = alice and idempotency_key is null;
 end $$;
 
+-- ── 13. Phase 5D-A: prediction creation idempotency key (database foundation only) ──
+-- Same user + same key = one prediction; different users may share a key; legacy NULL rows stay
+-- valid. Predictions are append-only, so rows created here are left in place.
+do $$
+declare
+  alice uuid := 'aaaaaaaa-0000-0000-0000-000000000001';
+  bob   uuid := 'bbbbbbbb-0000-0000-0000-000000000002';
+  btc   uuid := 'dddddddd-0000-0000-0000-000000000001';
+  k1 text := 'pred-idem-key-alice-0001';
+  pid uuid; hash_before text; n_before int; n int; col text;
+  ins text := $q$insert into public.predictions (user_id, asset_id, direction, target_price, invalidation_price, horizon_hours, idempotency_key)
+    values (%L, %L, 'BULLISH', 200, 100, 24, %L)$q$;
+begin
+  -- ── Structure ──
+  perform t.superuser();
+  perform t.ok(exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'predictions'
+      and column_name = 'idempotency_key' and data_type = 'text' and is_nullable = 'YES'),
+    'pidem: predictions.idempotency_key exists, is text and is nullable (legacy rows)');
+  perform t.ok(exists (select 1 from pg_index i where i.indexrelid = 'public.predictions_user_idempotency_key_uidx'::regclass
+      and i.indisunique and i.indpred is not null),
+    'pidem: the (user_id, idempotency_key) index is unique and partial');
+  perform t.ok((select pg_get_expr(i.indpred, i.indrelid) from pg_index i where i.indexrelid = 'public.predictions_user_idempotency_key_uidx'::regclass)
+      like '%idempotency_key IS NOT NULL%',
+    'pidem: the partial index predicate is "idempotency_key IS NOT NULL"');
+  perform t.ok((select count(*) from pg_attribute a where a.attrelid = 'public.predictions_user_idempotency_key_uidx'::regclass and a.attnum > 0) = 2,
+    'pidem: the unique index covers exactly (user_id, idempotency_key)');
+  perform t.ok((select relrowsecurity from pg_class where oid = 'public.predictions'::regclass), 'pidem: RLS is still enabled on predictions');
+
+  -- ── 1. Valid keys (service role, the only role that can write the column) ──
+  perform t.service();
+  execute format(ins, alice, btc, k1);
+  perform t.ok(exists (select 1 from public.predictions where user_id = alice and idempotency_key = k1), 'pidem 1: a valid key is accepted and stored');
+  execute format(ins, alice, btc, repeat('a', 16));
+  perform t.ok(exists (select 1 from public.predictions where user_id = alice and idempotency_key = repeat('a', 16)), 'pidem 1: a 16-character key is accepted (lower bound)');
+  execute format(ins, alice, btc, repeat('b', 128));
+  perform t.ok(exists (select 1 from public.predictions where user_id = alice and idempotency_key = repeat('b', 128)), 'pidem 1: a 128-character key is accepted (upper bound)');
+  execute format(ins, alice, btc, 'Aa0._-Aa0._-Aa0._-Aa0');
+  perform t.ok(exists (select 1 from public.predictions where user_id = alice and idempotency_key = 'Aa0._-Aa0._-Aa0._-Aa0'), 'pidem 1: every allowed character class is accepted');
+
+  -- ── 2. Malformed keys ──
+  perform t.fails_with(format(ins, alice, btc, ''), 'predictions_idempotency_key_format', 'pidem 2: an empty key is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'has a space in it 12345'), 'predictions_idempotency_key_format', 'pidem 2: a key with spaces is rejected');
+  perform t.fails_with(format(ins, alice, btc, '                '), 'predictions_idempotency_key_format', 'pidem 2: a whitespace-only key is rejected');
+  perform t.fails_with(format(ins, alice, btc, E'newline-key-12345\n6789'), 'predictions_idempotency_key_format', 'pidem 2: a key with an embedded newline is rejected');
+  perform t.fails_with(format(ins, alice, btc, E'valid-key-1234567890\n'), 'predictions_idempotency_key_format', 'pidem 2: a key with a trailing newline is rejected');
+
+  -- ── 3. Too short ──
+  perform t.fails_with(format(ins, alice, btc, 'a'), 'predictions_idempotency_key_format', 'pidem 3: a 1-character key is too short');
+  perform t.fails_with(format(ins, alice, btc, repeat('a', 15)), 'predictions_idempotency_key_format', 'pidem 3: a 15-character key is too short');
+
+  -- ── 4. Too long ──
+  perform t.fails_with(format(ins, alice, btc, repeat('a', 129)), 'predictions_idempotency_key_format', 'pidem 4: a 129-character key is too long');
+  perform t.fails_with(format(ins, alice, btc, repeat('a', 1000)), 'predictions_idempotency_key_format', 'pidem 4: a 1000-character key is too long');
+
+  -- ── 5. Invalid characters ──
+  perform t.fails_with(format(ins, alice, btc, 'bad/slash-key-123456'), 'predictions_idempotency_key_format', 'pidem 5: a slash is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'bad\backslash-key-1234'), 'predictions_idempotency_key_format', 'pidem 5: a backslash is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'quote''s-key-1234567890'), 'predictions_idempotency_key_format', 'pidem 5: a single quote is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'dq"-key-12345678901234'), 'predictions_idempotency_key_format', 'pidem 5: a double quote is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'colon:key-1234567890123'), 'predictions_idempotency_key_format', 'pidem 5: a colon is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'unicode-kéy-1234567890'), 'predictions_idempotency_key_format', 'pidem 5: a non-ASCII letter is rejected');
+  perform t.fails_with(format(ins, alice, btc, 'semi;colon-key-1234567'), 'predictions_idempotency_key_format', 'pidem 5: a semicolon is rejected');
+
+  -- ── 6. Same-user duplicate rejected ──
+  select count(*) into n_before from public.predictions where user_id = alice;
+  perform t.fails_with(format(ins, alice, btc, k1), 'predictions_user_idempotency_key_uidx', 'pidem 6: the same user cannot reuse a key');
+  perform t.fails_with(format($q$insert into public.predictions (user_id, asset_id, direction, target_price, invalidation_price, horizon_hours, idempotency_key)
+      values (%L, %L, 'BEARISH', 50, 80, 48, %L)$q$, alice, btc, k1),
+    'predictions_user_idempotency_key_uidx', 'pidem 6: a duplicate key is rejected even when the prediction content differs');
+  perform t.ok((select count(*) from public.predictions where user_id = alice) = n_before, 'pidem 6: rejected duplicates left no extra rows');
+  perform t.ok((select count(*) from public.predictions where user_id = alice and idempotency_key = k1) = 1, 'pidem 6: exactly one prediction exists for (alice, key)');
+
+  -- ── 7. Different users may use the same key ──
+  execute format(ins, bob, btc, k1);
+  perform t.superuser();
+  perform t.ok((select count(*) from public.predictions where idempotency_key = k1) = 2, 'pidem 7: Alice and Bob each hold one prediction for the shared key');
+  perform t.ok((select count(distinct user_id) from public.predictions where idempotency_key = k1) = 2, 'pidem 7: the two rows belong to different users');
+  -- ...and RLS still scopes visibility: neither user sees the other's private prediction.
+  perform t.login(alice);
+  perform t.count_is(format('select 1 from public.predictions where idempotency_key = %L', k1), 1, 'pidem 7: Alice sees only her own prediction for that key');
+  perform t.login(bob);
+  perform t.count_is(format('select 1 from public.predictions where idempotency_key = %L', k1), 1, 'pidem 7: Bob sees only his own prediction for that key');
+  perform t.superuser();
+
+  -- ── 8. Legacy NULL keys stay valid ──
+  perform t.ok((select count(*) from public.predictions where idempotency_key is null) > 0, 'pidem 8: pre-existing predictions still have a NULL key');
+  perform t.ok((select bool_and(char_length(content_hash) = 64) from public.predictions where idempotency_key is null), 'pidem 8: legacy rows keep their content_hash');
+  perform t.service();
+  select count(*) into n_before from public.predictions where user_id = alice and idempotency_key is null;
+  insert into public.predictions (user_id, asset_id, direction, target_price, invalidation_price, horizon_hours)
+    values (alice, btc, 'BULLISH', 200, 100, 24), (alice, btc, 'BULLISH', 200, 100, 24);
+  perform t.ok((select count(*) from public.predictions where user_id = alice and idempotency_key is null) = n_before + 2,
+    'pidem 8: many NULL-key rows per user are allowed (service role)');
+  -- The existing client path (no key column) keeps working for authenticated users.
+  perform t.login(alice);
+  insert into public.predictions (user_id, asset_id, direction, target_price, invalidation_price, horizon_hours)
+    values (alice, btc, 'BULLISH', 200, 100, 24) returning id into pid;
+  perform t.ok(exists (select 1 from public.predictions where id = pid and idempotency_key is null),
+    'pidem 8: a client-created prediction without a key still works and has a NULL key');
+  perform t.superuser();
+
+  -- ── Security: privileges on the new column ──
+  perform t.ok(not has_column_privilege('authenticated', 'public.predictions', 'idempotency_key', 'INSERT'), 'pidem sec: authenticated has no INSERT on idempotency_key');
+  perform t.ok(not has_column_privilege('anon', 'public.predictions', 'idempotency_key', 'INSERT'), 'pidem sec: anon has no INSERT on idempotency_key');
+  perform t.ok(not has_column_privilege('authenticated', 'public.predictions', 'idempotency_key', 'UPDATE'), 'pidem sec: authenticated has no UPDATE on idempotency_key');
+  perform t.ok(not has_column_privilege('anon', 'public.predictions', 'idempotency_key', 'UPDATE'), 'pidem sec: anon has no UPDATE on idempotency_key');
+  perform t.ok(not has_table_privilege('authenticated', 'public.predictions', 'UPDATE') and not has_table_privilege('authenticated', 'public.predictions', 'DELETE')
+      and not has_table_privilege('authenticated', 'public.predictions', 'TRUNCATE'),
+    'pidem sec: authenticated holds no table-level UPDATE, DELETE or TRUNCATE on predictions');
+  perform t.ok(not has_table_privilege('anon', 'public.predictions', 'INSERT') and not has_table_privilege('anon', 'public.predictions', 'SELECT'),
+    'pidem sec: anon holds no table-level INSERT or SELECT on predictions');
+  perform t.ok((select count(*) from pg_policies where schemaname = 'public' and tablename = 'predictions') = 2
+      and exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'predictions' and policyname = 'predictions_select' and cmd = 'SELECT')
+      and exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'predictions' and policyname = 'predictions_insert' and cmd = 'INSERT'),
+    'pidem sec: predictions RLS is unchanged (exactly predictions_select and predictions_insert)');
+
+  perform t.login(alice);
+  perform t.fails(format($q$insert into public.predictions (user_id, asset_id, direction, target_price, invalidation_price, horizon_hours, idempotency_key)
+      values (%L, %L, 'BULLISH', 200, 100, 24, %L)$q$, alice, btc, 'client-forged-key-0001'),
+    'pidem sec: a signed-in client cannot supply an idempotency_key on insert');
+  select id into pid from public.predictions where user_id = alice and idempotency_key = k1;
+  perform t.ok(pid is not null, 'pidem sec: the owner can read their own prediction and key');
+  perform t.fails(format('update public.predictions set idempotency_key = %L where id = %L', 'client-hijack-key-0001', pid), 'pidem sec: a user cannot update the key');
+  perform t.fails(format('update public.predictions set idempotency_key = null where id = %L', pid), 'pidem sec: a user cannot clear the key');
+  perform t.fails(format('delete from public.predictions where id = %L', pid), 'pidem sec: a user cannot delete a prediction');
+  perform t.login(bob);
+  perform t.count_is(format('select 1 from public.predictions where id = %L', pid), 0, 'pidem sec: another user cannot see Alice''s prediction or key');
+  perform t.anon();
+  perform t.fails(format('select 1 from public.predictions where id = %L', pid), 'pidem sec: anon cannot read predictions');
+
+  -- ── 9. Key immutability, for every role ──
+  perform t.service();
+  perform t.fails_with(format('update public.predictions set idempotency_key = %L where id = %L', 'service-hijack-key-001', pid), 'records are append-only',
+    'pidem 9: service_role cannot change the key');
+  perform t.fails(format('update public.predictions set idempotency_key = null where id = %L', pid), 'pidem 9: service_role cannot clear the key');
+  perform t.fails(format('update public.predictions set idempotency_key = %L where id = %L', 'service-assign-key-0001',
+      (select id from public.predictions where user_id = alice and idempotency_key is null limit 1)),
+    'pidem 9: service_role cannot back-fill a key onto a legacy row');
+  perform t.superuser();
+  perform t.fails(format('update public.predictions set idempotency_key = %L where id = %L', 'super-hijack-key-000001', pid), 'pidem 9: superuser cannot change the key (trigger)');
+  perform t.ok((select idempotency_key from public.predictions where id = pid) = k1, 'pidem 9: the key is unchanged after every attempt');
+
+  -- ── 10. Append-only behaviour remains intact ──
+  select content_hash into hash_before from public.predictions where id = pid;
+  perform t.login(alice);
+  perform t.fails(format('update public.predictions set target_price = 999 where id = %L', pid), 'pidem 10: owner still cannot edit a prediction');
+  perform t.fails(format('delete from public.predictions where id = %L', pid), 'pidem 10: owner still cannot delete a prediction');
+  perform t.service();
+  perform t.fails(format('update public.predictions set target_price = 999 where id = %L', pid), 'pidem 10: service_role still cannot edit a prediction');
+  perform t.fails(format('delete from public.predictions where id = %L', pid), 'pidem 10: service_role still cannot delete a prediction');
+  perform t.fails('truncate public.predictions', 'pidem 10: service_role still cannot truncate predictions');
+  perform t.superuser();
+  perform t.fails(format('update public.predictions set target_price = 999 where id = %L', pid), 'pidem 10: superuser still cannot edit a prediction (trigger)');
+  perform t.fails(format('delete from public.predictions where id = %L', pid), 'pidem 10: superuser still cannot delete a prediction (trigger)');
+  perform t.ok((select count(*) from pg_trigger where tgrelid = 'public.predictions'::regclass and not tgisinternal
+      and tgname in ('predictions_append_only', 'predictions_no_truncate', 'predictions_before_insert')) = 3,
+    'pidem 10: the append-only, no-truncate and before-insert triggers are all still present');
+
+  -- content_hash behaviour is unchanged: still sha256, still v2, and it does not depend on the key.
+  perform t.ok((select content_hash from public.predictions where id = pid) = hash_before, 'pidem 10: content_hash is unchanged');
+  perform t.ok((select hash_version from public.predictions where id = pid) = 2 and char_length(hash_before) = 64, 'pidem 10: hash_version is still 2 with a sha256 hash');
+  perform t.ok(
+    (select content_hash from public.predictions where id = pid)
+      = (select encode(sha256(convert_to(concat_ws('|',
+          p.id, p.user_id, p.origin, p.asset_id, p.direction,
+          p.target_price::text, p.invalidation_price::text, p.horizon_hours::text,
+          coalesce(p.rationale, ''), p.created_at::text,
+          coalesce(p.timeframe, ''), coalesce(p.entry_reference_price::text, ''), coalesce(p.engine_version, ''),
+          coalesce(p.signal_agreement::text, ''), coalesce(p.entry_quote_source, ''),
+          coalesce(p.entry_quote_as_of::text, ''), coalesce(p.entry_quote_fetched_at::text, ''),
+          coalesce(p.entry_quote_is_mock::text, ''), coalesce(p.engine_snapshot::text, '')
+        ), 'UTF8')), 'hex')
+         from public.predictions p where p.id = pid),
+    'pidem 10: content_hash still matches the v2 recipe, which does not include the key');
+  perform t.ok((select count(*) from public.predictions where user_id = alice and idempotency_key = k1) = 1, 'pidem 10: the original keyed prediction is still present exactly once');
+end $$;
+
 drop schema t cascade;
