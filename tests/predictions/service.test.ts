@@ -88,7 +88,8 @@ function harness(o: {
   return { deps, inserted, audits, getQuote, getCandles };
 }
 
-const INPUT = { assetId: ASSET_ID, timeframe: "1h" };
+const KEY = "tm-test-key-0123456789";
+const INPUT = { assetId: ASSET_ID, timeframe: "1h", idempotencyKey: KEY };
 const expectRejected = async (p: Promise<unknown>, reason: PredictionRejectionReason) => {
   const err = await p.then(
     () => null,
@@ -220,14 +221,14 @@ describe("persisted content", () => {
 
 describe("invalid inputs", () => {
   it.each([
-    ["missing asset", { timeframe: "1h" }],
-    ["missing timeframe", { assetId: ASSET_ID }],
-    ["seed catalogue id", { assetId: "seed:btc", timeframe: "1h" }],
-    ["non-uuid id", { assetId: "btc", timeframe: "1h" }],
-    ["unsupported timeframe 1w", { assetId: ASSET_ID, timeframe: "1w" }],
-    ["unsupported timeframe 1m", { assetId: ASSET_ID, timeframe: "1m" }],
-    ["unknown timeframe", { assetId: ASSET_ID, timeframe: "2h" }],
-    ["numeric timeframe", { assetId: ASSET_ID, timeframe: 60 }],
+    ["missing asset", { timeframe: "1h", idempotencyKey: KEY }],
+    ["missing timeframe", { assetId: ASSET_ID, idempotencyKey: KEY }],
+    ["seed catalogue id", { assetId: "seed:btc", timeframe: "1h", idempotencyKey: KEY }],
+    ["non-uuid id", { assetId: "btc", timeframe: "1h", idempotencyKey: KEY }],
+    ["unsupported timeframe 1w", { assetId: ASSET_ID, timeframe: "1w", idempotencyKey: KEY }],
+    ["unsupported timeframe 1m", { assetId: ASSET_ID, timeframe: "1m", idempotencyKey: KEY }],
+    ["unknown timeframe", { assetId: ASSET_ID, timeframe: "2h", idempotencyKey: KEY }],
+    ["numeric timeframe", { assetId: ASSET_ID, timeframe: 60, idempotencyKey: KEY }],
     ["null", null],
     ["string", "BTC"],
     ["array", []],

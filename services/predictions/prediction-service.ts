@@ -64,6 +64,8 @@ const REJECT_TEXT = {
   NO_DIRECTIONAL_SIGNAL:
     "The signals do not agree strongly enough for a directional prediction right now (neutral). Nothing was saved.",
   INVALID_LEVELS: "The computed target and invalidation levels were not valid for this price. Nothing was saved.",
+  IDEMPOTENCY_KEY_REUSED:
+    "This request was already used for a different prediction. Review the details and try again. No prediction was created.",
 } as const;
 
 const reject = (reason: keyof typeof REJECT_TEXT, detail?: Record<string, unknown>): never => {

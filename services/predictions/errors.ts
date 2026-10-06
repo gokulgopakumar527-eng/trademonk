@@ -12,7 +12,9 @@ export type PredictionRejectionReason =
   | "INSUFFICIENT_DATA"
   | "DATA_INCONSISTENT"
   | "NO_DIRECTIONAL_SIGNAL"
-  | "INVALID_LEVELS";
+  | "INVALID_LEVELS"
+  /** The same idempotency key was already used for a different prediction intent. */
+  | "IDEMPOTENCY_KEY_REUSED";
 
 const CODE: Record<PredictionRejectionReason, AppErrorCode> = {
   ASSET_NOT_FOUND: "NOT_FOUND",
@@ -27,6 +29,7 @@ const CODE: Record<PredictionRejectionReason, AppErrorCode> = {
   DATA_INCONSISTENT: "PROVIDER_UNAVAILABLE",
   NO_DIRECTIONAL_SIGNAL: "VALIDATION",
   INVALID_LEVELS: "VALIDATION",
+  IDEMPOTENCY_KEY_REUSED: "VALIDATION",
 };
 
 /** A prediction was refused. `message` is safe to show to the user. */
